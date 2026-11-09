@@ -1,0 +1,38 @@
+{
+  "signal": {
+    "n_minutes": 3,
+    "m_minutes": 30,
+    "x_sd": 1
+  },
+  "layering": {
+    "max_positions": 3,
+    "layer_step": 0.3
+  },
+  "filters": {
+    "width_ticks": 1,
+    "sync_s": 0.5,
+    "min_depth": 1,
+    "volume_ratio_max": 0,
+    "roll_entry_cutoff_days": 3,
+    "roll_exit_days": 1,
+    "momentum_min": 0
+  },
+  "exit": {
+    "stop_loss": 10000,
+    "min_exit_pnl": 10,
+    "max_hold_days": 999,
+    "order_timeout_s": 6000000000
+  },
+  "mode": "real",
+  "close_only": true,
+  "tick_size": 1,
+  "multiplier": 10,
+  "margin_per_lot": 3000,
+  "name": "m2701&m2703",
+  "session": {
+    "night_segments": [
+      "21:00-23:00"
+    ]
+  },
+  "exit_preplace": true
+}

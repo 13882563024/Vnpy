@@ -1,0 +1,964 @@
+{
+  "meta": {
+    "source": "全品种手续费表_交易所标准_20260919(1).xlsx",
+    "generated_at": "2026-10-28 20:14:08",
+    "default": {
+      "exchange": "",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 2.0
+    },
+    "product_count": 88,
+    "contract_count": 47
+  },
+  "products": {
+    "A": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 2.0
+    },
+    "AD": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "AG": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.5
+    },
+    "AL": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "AO": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 1.5,
+      "close_yesterday": 1.5,
+      "close_today": 1.5
+    },
+    "AP": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 5.0,
+      "close_yesterday": 5.0,
+      "close_today": 20.0
+    },
+    "AU": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 10.0,
+      "close_yesterday": 10.0,
+      "close_today": 0.0
+    },
+    "B": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "BB": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "BC": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "BR": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "BU": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "BZ": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "C": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.2,
+      "close_yesterday": 1.2,
+      "close_today": 1.2
+    },
+    "CF": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 4.3,
+      "close_yesterday": 4.3,
+      "close_today": 0.0
+    },
+    "CJ": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "CS": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.5,
+      "close_yesterday": 1.5,
+      "close_today": 1.5
+    },
+    "CU": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 1.0
+    },
+    "CY": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "EB": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "EC": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 6.0,
+      "close_yesterday": 6.0,
+      "close_today": 12.0
+    },
+    "EG": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "FB": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "FG": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 6.0,
+      "close_yesterday": 6.0,
+      "close_today": 6.0
+    },
+    "FU": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "HC": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "I": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "IC": {
+      "exchange": "CFFEX",
+      "unit": "万分之",
+      "open": 0.23,
+      "close_yesterday": 0.23,
+      "close_today": 2.3
+    },
+    "IF": {
+      "exchange": "CFFEX",
+      "unit": "万分之",
+      "open": 0.23,
+      "close_yesterday": 0.23,
+      "close_today": 2.3
+    },
+    "IH": {
+      "exchange": "CFFEX",
+      "unit": "万分之",
+      "open": 0.23,
+      "close_yesterday": 0.23,
+      "close_today": 2.3
+    },
+    "IM": {
+      "exchange": "CFFEX",
+      "unit": "万分之",
+      "open": 0.23,
+      "close_yesterday": 0.23,
+      "close_today": 2.3
+    },
+    "J": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.4
+    },
+    "JD": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.5,
+      "close_yesterday": 1.5,
+      "close_today": 1.5
+    },
+    "JM": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "JR": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "L": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "LC": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 0.8,
+      "close_yesterday": 0.8,
+      "close_today": 0.0
+    },
+    "LG": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "LH": {
+      "exchange": "DCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 2.0
+    },
+    "LR": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "LU": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "M": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.5,
+      "close_yesterday": 1.5,
+      "close_today": 1.5
+    },
+    "MA": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "NI": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "NR": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.0
+    },
+    "OI": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 2.0
+    },
+    "OP": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "P": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 2.5,
+      "close_yesterday": 2.5,
+      "close_today": 2.5
+    },
+    "PB": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.4,
+      "close_yesterday": 0.4,
+      "close_today": 0.0
+    },
+    "PD": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "PF": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "PG": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 6.0,
+      "close_yesterday": 6.0,
+      "close_today": 6.0
+    },
+    "PK": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 4.0,
+      "close_yesterday": 4.0,
+      "close_today": 4.0
+    },
+    "PL": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "PM": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 30.0,
+      "close_yesterday": 30.0,
+      "close_today": 30.0
+    },
+    "PP": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "PR": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "PS": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "PT": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "PX": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "RB": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "RI": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 2.5,
+      "close_yesterday": 2.5,
+      "close_today": 2.5
+    },
+    "RM": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 1.5,
+      "close_yesterday": 1.5,
+      "close_today": 1.5
+    },
+    "RR": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "RS": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 2.0
+    },
+    "RU": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "SA": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 2.0
+    },
+    "SC": {
+      "exchange": "上期能源",
+      "unit": "元",
+      "open": 20.0,
+      "close_yesterday": 20.0,
+      "close_today": 0.0
+    },
+    "SF": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "SH": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "SI": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 0.0
+    },
+    "SM": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "SN": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 3.0
+    },
+    "SP": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.5,
+      "close_yesterday": 0.5,
+      "close_today": 0.0
+    },
+    "SR": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "SS": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "T": {
+      "exchange": "CFFEX",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "TA": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "TF": {
+      "exchange": "CFFEX",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "TL": {
+      "exchange": "CFFEX",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "TS": {
+      "exchange": "CFFEX",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    },
+    "UR": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "V": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "WH": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 30.0,
+      "close_yesterday": 30.0,
+      "close_today": 30.0
+    },
+    "WR": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.4,
+      "close_yesterday": 0.4,
+      "close_today": 0.0
+    },
+    "Y": {
+      "exchange": "DCE",
+      "unit": "元",
+      "open": 2.5,
+      "close_yesterday": 2.5,
+      "close_today": 2.5
+    },
+    "ZC": {
+      "exchange": "CZCE",
+      "unit": "元",
+      "open": 150.0,
+      "close_yesterday": 150.0,
+      "close_today": 150.0
+    },
+    "ZN": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 0.0
+    }
+  },
+  "contracts": {
+    "SH503": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 2.0
+    },
+    "SH504": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 2.0
+    },
+    "SH505": {
+      "exchange": "CZCE",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 2.0
+    },
+    "ag2507": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2508": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2509": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2510": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2511": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2601": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2602": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "ag2603": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.1
+    },
+    "au2508": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "au2510": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "au2602": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "au2604": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 2.0,
+      "close_yesterday": 2.0,
+      "close_today": 0.0
+    },
+    "br2503": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.6
+    },
+    "br2504": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.6
+    },
+    "ec2504": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 6.0,
+      "close_yesterday": 6.0,
+      "close_today": 12.0
+    },
+    "ec2506": {
+      "exchange": "上期能源",
+      "unit": "万分之",
+      "open": 6.0,
+      "close_yesterday": 6.0,
+      "close_today": 12.0
+    },
+    "fu2507": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2508": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2510": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2511": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2512": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2602": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2603": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "fu2604": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.1,
+      "close_yesterday": 0.1,
+      "close_today": 0.0
+    },
+    "hc2507": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2508": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2509": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2511": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2512": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2602": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "hc2603": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "pd2606": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "pt2606": {
+      "exchange": "GFEX",
+      "unit": "万分之",
+      "open": 1.0,
+      "close_yesterday": 1.0,
+      "close_today": 1.0
+    },
+    "rb2507": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2508": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2509": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2511": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2512": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2602": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "rb2603": {
+      "exchange": "SHFE",
+      "unit": "万分之",
+      "open": 0.2,
+      "close_yesterday": 0.2,
+      "close_today": 0.2
+    },
+    "ru2505": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 9.0
+    },
+    "sn2504": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 15.0
+    },
+    "sn2505": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 15.0
+    },
+    "sn2506": {
+      "exchange": "SHFE",
+      "unit": "元",
+      "open": 3.0,
+      "close_yesterday": 3.0,
+      "close_today": 15.0
+    }
+  }
+}

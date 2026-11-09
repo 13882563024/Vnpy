@@ -1,0 +1,9 @@
+{
+  "record_ticks": true,
+  "record_symbols": [],
+  "record_spreads": true,
+  "record_snap_ms": 500,
+  "record_batch_size": 300,
+  "record_flush_interval": 5.0,
+  "record_status_every": 120.0
+}

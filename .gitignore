@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.log
+
+# 本机 TLS 直连用的 CA 合并包（GitHub 加速的 MITM 证书）
+.dsh-tls/
+
+# 运行期产物 / 临时目录
+artifacts/
+.dsh-acl/
+.acl-recovery/
+.reasonix/
