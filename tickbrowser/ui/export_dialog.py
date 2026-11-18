@@ -7,6 +7,13 @@ from pathlib import Path
 
 from vnpy.trader.ui import QtCore, QtWidgets
 
+try:                                    # PySide6 一定有 shiboken6
+    from shiboken6 import isValid as _qt_alive
+except ImportError:                     # pragma: no cover - 兼容非 PySide6 环境
+    def _qt_alive(obj) -> bool:
+        return True
+
+
 DEFAULT_OUTPUT_ROOT = Path("exports") / "spread_csv"
 
 
@@ -162,9 +169,28 @@ class SpreadExportDialog(QtWidgets.QDialog):
                 names.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
         return names
 
+    def _worker_is_running(self) -> bool:
+        """后台线程是否还在跑；顺带清掉已结束（甚至 C++ 已销毁）的旧线程。
+
+        ``deleteLater`` 之后 Python 侧的引用不会自动失效，直接 ``isRunning()``
+        会抛 ``RuntimeError: Internal C++ object already deleted``。
+        """
+        worker = self._worker
+        if worker is None:
+            return False
+        if not _qt_alive(worker):
+            self._worker = None
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:      # C++ 对象已销毁
+            self._worker = None
+            return False
+
     def _start(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker_is_running():
             return
+        self._worker = None       # 丢弃上一轮已结束的线程
         names = self.selected_names()
         if not names:
             self.progress_label.setText("没有勾选任何价差")
@@ -180,9 +206,13 @@ class SpreadExportDialog(QtWidgets.QDialog):
         self._worker.progressed.connect(self._on_progress)
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
-        # 线程跑完再销毁对象，避免"QThread: Destroyed while thread is still running"
+        # 先清引用再 deleteLater：否则 finished 之后 self._worker 还指向已销毁的对象
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def _on_worker_finished(self) -> None:
+        self._worker = None
 
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
@@ -210,7 +240,7 @@ class SpreadExportDialog(QtWidgets.QDialog):
         self.result.setPlainText(f"导出失败：{message}")
 
     def closeEvent(self, event) -> None:          # noqa: N802 - Qt 命名
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker_is_running():
             self.progress_label.setText("导出进行中，完成后再关闭（不会卡住主界面）")
             event.ignore()
             return

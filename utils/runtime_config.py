@@ -13,6 +13,8 @@
 ``record_batch_size``  每批落库条数（默认 300）
 ``record_flush_interval`` 落库间隔秒（默认 5，GUI 进程里放宽以免频繁写盘）
 ``record_status_every``   日志里报告录制进度的间隔秒（默认 120）
+``record_orders``    委托事件按交易日写 CSV（``~/.vntrader/records/<交易日>/orders.csv``）
+``record_trades``    成交明细按交易日写 CSV（同目录 ``trades.csv``）
 ===================  ====================================================
 """
 
@@ -37,6 +39,9 @@ class RuntimeConfig:
     record_batch_size: int = 300
     record_flush_interval: float = 5.0
     record_status_every: float = 120.0
+    # 委托/成交另存 CSV（~/.vntrader/records/<交易日>/），与 tick 采集互不影响
+    record_orders: bool = True
+    record_trades: bool = True
 
     def describe(self) -> str:
         if not self.record_ticks:
@@ -46,6 +51,15 @@ class RuntimeConfig:
         spread = "含合成价差" if self.record_spreads else "只录腿"
         return (f"落库 {scope}（{grid}、{spread}；"
                 f"每 {self.record_flush_interval:g}s 或 {self.record_batch_size} 条写一次）")
+
+    def describe_records(self) -> str:
+        """委托/成交 CSV 的开启情况（与 tick 落库描述分开）。"""
+        parts = []
+        if self.record_orders:
+            parts.append("委托")
+        if self.record_trades:
+            parts.append("成交")
+        return "、".join(parts) + "记录已开启" if parts else "委托与成交记录已关闭"
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -81,4 +95,6 @@ def load_runtime_config(path: Path | str | None = None) -> RuntimeConfig:
         record_batch_size=int(raw.get("record_batch_size", 300) or 300),
         record_flush_interval=float(raw.get("record_flush_interval", 5.0) or 5.0),
         record_status_every=float(raw.get("record_status_every", 120.0) or 120.0),
+        record_orders=_as_bool(raw.get("record_orders"), True),
+        record_trades=_as_bool(raw.get("record_trades"), True),
     )

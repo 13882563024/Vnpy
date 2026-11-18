@@ -22,7 +22,7 @@ from vnpy.trader.constant import Direction, Exchange, Status  # noqa: E402
 from vnpy.trader.object import TickData  # noqa: E402
 from vnpy_spreadtrading.base import EngineType, LegData, SpreadData  # noqa: E402
 
-from execution.base import DIRECTION_LONG  # noqa: E402
+from execution.base import DIRECTION_LONG, PositionLayer, TierState  # noqa: E402
 from strategies.cross_period_mean_reversion import CrossPeriodMRStrategy  # noqa: E402
 from utils.risk_limits import RiskLimits  # noqa: E402
 
@@ -486,6 +486,64 @@ class TestStopLoss(unittest.TestCase):
         self.assertLess(strategy.daily_realized, 0)
         self.assertTrue(layer.close_reason.startswith("止损"))
 
+    def test_stop_loss_starts_from_top_layer(self) -> None:
+        """多层同价时止损从**最高层（最新层）**开始，而不是最早层。
+
+        2026-11-17 22:59 焦炭实测：第1、2 层同为 84.5，旧逻辑按遍历顺序先平第1层，
+        与止盈“从最新层开始”的口径不一致。
+        """
+        strategy, engine, spread = make_strategy({"stop_loss": 300, "max_positions": 3})
+        for index in range(1, 4):
+            strategy.layers.append(PositionLayer(
+                direction=DIRECTION_LONG, volume=1, avg_spread=-100.0,
+                layer_index=index))
+        strategy.direction = DIRECTION_LONG
+        engine.reset_logs()
+
+        # 价差打到 -116：每层浮亏 -160 ≤ -100（300 ÷ 3）
+        feed_quote(spread, 3995, 3996, 4110, 4111, moment=MOMENT)
+        strategy.on_spread_data()
+
+        self.assertEqual(len(engine.active_algos("close")), 1, engine.logs)
+        self.assertTrue(
+            any("止损" in log and "第3层" in log for log in engine.logs), engine.logs)
+
+    def test_close_all_settles_from_top_layer(self) -> None:
+        """整仓平仓（时间止损）按从高到低的顺序扣减层账。"""
+        strategy, engine, spread = make_strategy({"max_hold_days": 1})
+        for index in range(1, 4):
+            strategy.layers.append(PositionLayer(
+                direction=DIRECTION_LONG, volume=1, avg_spread=-100.0,
+                open_trading_day="2026-10-27", layer_index=index))
+        strategy.direction = DIRECTION_LONG
+        feed_quote(spread, 4000, 4001, 4102, 4103, moment=MOMENT)
+        engine.reset_logs()
+        strategy.on_spread_data()
+
+        close_algos = engine.active_algos("close")
+        self.assertEqual(len(close_algos), 1, engine.logs)
+        # 只平 1 手：必须从最高层（第3层）扣，剩余 2 层
+        engine.fill(close_algos[0].algoid, price=-101.0, volume=1)
+
+        self.assertEqual(len(strategy.layers), 2)
+        self.assertIn(3, [layer.layer_index for layer in strategy.closed_layers])
+        self.assertEqual([layer.layer_index for layer in strategy.layers], [1, 2])
+
+    def test_allow_stop_loss_false_skips_tier_stop(self) -> None:
+        """allow_stop_loss=False 时不砍浮亏（时间止损/换月强平仍生效）。"""
+        strategy, engine, spread = make_strategy(
+            {"stop_loss": 100, "allow_stop_loss": False})
+        self._open_layer(strategy, engine, spread)
+        engine.reset_logs()
+
+        feed_quote(spread, 4000, 4001, 4105, 4106, moment=MOMENT + timedelta(seconds=1))
+        strategy.on_spread_data()
+
+        self.assertEqual(engine.active_algos("close"), [], engine.logs)
+        self.assertEqual(len(strategy.layers), 1)
+        self.assertFalse(
+            any("平仓请求：止损" in log for log in engine.logs), engine.logs)
+
     def test_stop_loss_respects_threshold_boundary(self) -> None:
         """浮亏刚好没到 -stop_loss/max_positions 时不该止损。"""
         strategy, engine, spread = make_strategy({"stop_loss": 1000})
@@ -617,6 +675,299 @@ class TestNewTradingDay(unittest.TestCase):
         self.assertEqual(len(strategy.layers), 1)
         # 新交易日的止盈单由策略重新挂出（旧单仅本地归档，不再撤单）
         self.assertEqual(len(strategy.algoids), 1)
+
+
+class TestTakeProfitRejection(unittest.TestCase):
+    """回归：止盈单被柜台拒掉后必须放开占位并重挂（2026-11-09 夜盘事故）。"""
+
+    def _open_layer(self, setting: dict | None = None) -> tuple[CrossPeriodMRStrategy, FakeEngine]:
+        options = {"min_exit_pnl_override": 10, "exit_retry_backoff": "0"}
+        options.update(setting or {})
+        strategy, engine, spread = make_strategy(options)
+        warm_up(strategy, [-100.0, -100.4] * 20)
+        feed_quote(spread, 4000, 4001, 4102, 4103)
+        strategy.on_spread_data()
+        engine.fill(engine.active_algos("open")[0].algoid, price=-101.0)
+        strategy.cabinet_position_check = lambda direction, volume: True
+        return strategy, engine
+
+    def test_rejected_take_profit_releases_slot_and_reprepares(self) -> None:
+        strategy, engine = self._open_layer()
+        rejected = engine.active_algos("take_profit")[0]
+        layer = strategy.layers[0]
+        self.assertEqual(strategy.exit_algoid, rejected.algoid)
+        self.assertEqual(layer.algoid, rejected.algoid)
+
+        # 柜台拒单后算法收尾为 CANCELLED（等价 CTP 40052「集合竞价撮合」）
+        rejected.status = Status.CANCELLED
+        engine.strategies[rejected.algoid].update_spread_algo(rejected)
+
+        self.assertEqual(strategy.exit_algoid, "")
+        self.assertEqual(layer.algoid, "")
+        self.assertTrue(any("重新挂出止盈单" in log for log in engine.logs), engine.logs)
+
+        strategy._maybe_preplace_exit(MOMENT)
+        algos = engine.active_algos("take_profit")
+        self.assertEqual(len(algos), 1)
+        self.assertNotEqual(algos[0].algoid, rejected.algoid)
+
+    def test_retry_backoff_delays_reprepare(self) -> None:
+        """终止后必须等退避时间过去才重挂，避免毫秒级连发烧光重试预算。"""
+        strategy, engine = self._open_layer({"exit_retry_backoff": "3600"})
+        algo = engine.active_algos("take_profit")[0]
+        algo.status = Status.CANCELLED
+        engine.strategies[algo.algoid].update_spread_algo(algo)
+
+        self.assertTrue(any("3600s 后重新挂出止盈单" in log for log in engine.logs), engine.logs)
+        strategy._maybe_preplace_exit(MOMENT)
+        self.assertEqual(engine.active_algos("take_profit"), [])
+
+    def test_consecutive_rejections_switch_to_low_frequency(self) -> None:
+        """熔断后转入低频重试，而不是全天放弃：2026-11-11 熔断后 7 个持仓裸奔 6 小时。"""
+        strategy, engine = self._open_layer()
+        layer = strategy.layers[0]
+        limit = int(strategy.exit_retry_limit)
+        for _ in range(limit):
+            strategy._maybe_preplace_exit(MOMENT)
+            algos = engine.active_algos("take_profit")
+            self.assertTrue(algos, engine.logs)
+            algo = algos[0]
+            algo.status = Status.CANCELLED
+            engine.strategies[algo.algoid].update_spread_algo(algo)
+
+        self.assertEqual(layer.retry_count, limit)
+        self.assertEqual(layer.state, TierState.PENDING_RETRY)
+        self.assertTrue(any("转为低频重试" in log for log in engine.logs), engine.logs)
+
+        # 冷却期内不再重挂
+        strategy._maybe_preplace_exit(MOMENT)
+        self.assertEqual(engine.active_algos("take_profit"), [])
+
+        # 冷却时间过去 → 允许再试一次
+        strategy._exit_retry_at[layer.tier_id] = 0.0
+        strategy._maybe_preplace_exit(MOMENT)
+        self.assertEqual(len(engine.active_algos("take_profit")), 1)
+
+    def test_low_frequency_retry_can_be_disabled(self) -> None:
+        strategy, engine = self._open_layer({"exit_retry_cooldown": 0})
+        layer = strategy.layers[0]
+        for _ in range(int(strategy.exit_retry_limit)):
+            strategy._maybe_preplace_exit(MOMENT)
+            algos = engine.active_algos("take_profit")
+            self.assertTrue(algos, engine.logs)
+            algo = algos[0]
+            algo.status = Status.CANCELLED
+            engine.strategies[algo.algoid].update_spread_algo(algo)
+
+        self.assertTrue(any("停止重挂" in log for log in engine.logs), engine.logs)
+        strategy._exit_retry_at[layer.tier_id] = 0.0
+        strategy._maybe_preplace_exit(MOMENT)
+        self.assertEqual(engine.active_algos("take_profit"), [])
+
+    def test_low_frequency_warning_is_printed_once(self) -> None:
+        """熔断告警只打一次：2026-11-10 曾每 tick 打一次，刷了 4791 行。"""
+        strategy, engine = self._open_layer()
+        for _ in range(int(strategy.exit_retry_limit)):
+            strategy._maybe_preplace_exit(MOMENT)
+            algos = engine.active_algos("take_profit")
+            self.assertTrue(algos, engine.logs)
+            algo = algos[0]
+            algo.status = Status.CANCELLED
+            engine.strategies[algo.algoid].update_spread_algo(algo)
+
+        engine.reset_logs()
+        for _ in range(50):
+            strategy._maybe_preplace_exit(MOMENT)
+        self.assertEqual([log for log in engine.logs if "转为低频重试" in log], [])
+
+
+class TestPositionReconcile(unittest.TestCase):
+    """2026-11-11 事故回归：柜台比本地多出来的手数必须进入策略管理。
+
+    当天 I_2701_2703 柜台 2 手、本地只记 1 手，多出的 1 手没有任何止盈/止损。
+    """
+
+    def _setup(self, cabinet_net: float = 2.0):
+        strategy, engine, spread = make_strategy()
+        spread.net_pos = cabinet_net
+        spread.legs[NEAR].net_pos = cabinet_net
+        spread.legs[FAR].net_pos = -cabinet_net
+        strategy._legacy_leg_price = lambda leg: {
+            NEAR: 5265.0, FAR: 5279.0}.get(leg.vt_symbol)
+        strategy.cabinet_position_check = lambda direction, volume: False
+        return strategy, engine, spread
+
+    def test_fills_gap_above_existing_layers(self) -> None:
+        strategy, _engine, _spread = self._setup(cabinet_net=2.0)
+        strategy.layers.append(PositionLayer(
+            direction=DIRECTION_LONG, volume=1, avg_spread=-14.0, layer_index=1))
+        strategy.direction = DIRECTION_LONG
+
+        added = strategy.reconcile_legacy_position()
+
+        self.assertAlmostEqual(added, 1.0)
+        self.assertEqual(len(strategy.layers), 2)
+        self.assertAlmostEqual(strategy.layers[-1].volume, 1.0)
+        self.assertTrue(strategy.layers[-1].adopted)
+        self.assertEqual(strategy.layers[-1].layer_index, 2)
+
+    def test_adopts_whole_position_when_no_layers(self) -> None:
+        strategy, _engine, _spread = self._setup(cabinet_net=2.0)
+
+        added = strategy.reconcile_legacy_position()
+
+        self.assertAlmostEqual(added, 2.0)
+        # 2 手按「每层 1 手」拆成 2 层。并成 1 层会让 max_positions 以为还有空位，
+        # 于是当天还能再开 2 层（2026-11-17 实测持仓涨到 5 手，超过 3 层上限）。
+        self.assertEqual(len(strategy.layers), 2)
+        self.assertEqual([layer.layer_index for layer in strategy.layers], [1, 2])
+        self.assertAlmostEqual(strategy.layers[0].avg_spread, -14.0)   # 5265 - 5279
+        self.assertTrue(all(layer.adopted for layer in strategy.layers))
+
+    def test_adopted_layers_occupy_max_positions_slots(self) -> None:
+        """接管 3 手必须占满 3 个层位，否则当天会超出上限继续加仓。"""
+        strategy, _engine, _spread = self._setup(cabinet_net=3.0)
+        strategy.max_positions = 3
+
+        strategy.reconcile_legacy_position()
+
+        self.assertEqual(len(strategy.layers), 3, "3 手应拆成 3 层")
+        self.assertEqual(len(strategy.layers), int(strategy.max_positions),
+                         "接管的层数必须占满 max_positions，不能再有空位")
+
+    def test_fills_short_gap_above_existing_layers(self) -> None:
+        """空头方向同样要补层：柜台 -2 / 本地 -1 曾因 gap 符号被判成“柜台少仓”。"""
+        strategy, engine, _spread = self._setup(cabinet_net=-2.0)
+        strategy.layers.append(PositionLayer(
+            direction=-DIRECTION_LONG, volume=1, avg_spread=-14.0, layer_index=1))
+        strategy.direction = -DIRECTION_LONG
+        engine.reset_logs()
+
+        added = strategy.reconcile_legacy_position()
+
+        self.assertAlmostEqual(added, 1.0)
+        self.assertEqual(len(strategy.layers), 2)
+        self.assertEqual(strategy.layers[-1].direction, -DIRECTION_LONG)
+        self.assertTrue(any("补入 1 手" in log for log in engine.logs), engine.logs)
+
+    def test_adopt_splits_whole_position_into_one_lot_layers(self) -> None:
+        """接管 3 手必须拆成 3 层（每层 1 手）。
+
+        并成「第1层 3手」会同时踩两个坑：max_positions 只被占 1 个层位（还能再开
+        2 层），止盈也只能整层挂 3 手（撞柜台在途单）或只挂 1 手（其余裸奔）。
+        """
+        strategy, engine, _spread = self._setup(cabinet_net=3.0)
+        strategy.cabinet_position_check = lambda direction, volume: True
+        engine.reset_logs()
+
+        self.assertTrue(strategy.adopt_legacy_position())
+
+        self.assertEqual([layer.volume for layer in strategy.layers], [1.0, 1.0, 1.0])
+        self.assertEqual([layer.layer_index for layer in strategy.layers], [1, 2, 3])
+        algos = engine.active_algos("take_profit")
+        self.assertEqual(len(algos), 1, "同一合约同一时刻只保留一张止盈单")
+        self.assertEqual(algos[0].volume, 1.0, "这张单盯最新层，量就是 1 手")
+
+    def test_take_profit_moves_to_next_layer_after_fill(self) -> None:
+        """最新层止盈成交后，自动把唯一那张单挪到下一层（LIFO）。"""
+        strategy, engine, _spread = self._setup(cabinet_net=3.0)
+        strategy.cabinet_position_check = lambda direction, volume: True
+        strategy.adopt_legacy_position()
+        first = engine.active_algos("take_profit")[0]
+        filled_tier = strategy.layers[-1].tier_id
+
+        engine.fill(first.algoid)
+
+        algos = engine.active_algos("take_profit")
+        self.assertEqual(len(algos), 1, "仍然只有一张止盈单")
+        self.assertEqual(len(strategy.layers), 2)
+        self.assertNotEqual(strategy.layers[-1].tier_id, filled_tier)
+        self.assertEqual(algos[0].volume, 1.0)
+
+    def test_no_action_when_already_consistent(self) -> None:
+        strategy, engine, _spread = self._setup(cabinet_net=1.0)
+        strategy.layers.append(PositionLayer(
+            direction=DIRECTION_LONG, volume=1, avg_spread=-14.0, layer_index=1))
+        strategy.direction = DIRECTION_LONG
+        engine.reset_logs()
+
+        self.assertAlmostEqual(strategy.reconcile_legacy_position(), 0.0)
+        self.assertEqual(len(strategy.layers), 1)
+        self.assertEqual(engine.logs, [])
+
+    def test_never_reduces_local_layers(self) -> None:
+        """柜台少于本地多半是成交未回报，自动减层会掩盖真实敞口。"""
+        strategy, engine, _spread = self._setup(cabinet_net=1.0)
+        strategy.layers.append(PositionLayer(
+            direction=DIRECTION_LONG, volume=2, avg_spread=-14.0, layer_index=1))
+        strategy.direction = DIRECTION_LONG
+        engine.reset_logs()
+
+        self.assertAlmostEqual(strategy.reconcile_legacy_position(), 0.0)
+        self.assertEqual(len(strategy.layers), 1)
+        self.assertTrue(any("不自动减层" in log for log in engine.logs), engine.logs)
+
+    def test_skips_when_legs_disagree(self) -> None:
+        strategy, engine, spread = self._setup(cabinet_net=2.0)
+        spread.legs[FAR].net_pos = -1          # 两腿不一致
+        engine.reset_logs()
+
+        self.assertAlmostEqual(strategy.reconcile_legacy_position(), 0.0)
+        self.assertEqual(strategy.layers, [])
+        self.assertTrue(any("两腿与价差净仓不符" in log for log in engine.logs), engine.logs)
+
+    def test_skips_without_cabinet_average_price(self) -> None:
+        strategy, engine, _spread = self._setup(cabinet_net=2.0)
+        strategy._legacy_leg_price = lambda leg: None
+        engine.reset_logs()
+
+        self.assertAlmostEqual(strategy.reconcile_legacy_position(), 0.0)
+        self.assertEqual(strategy.layers, [])
+        self.assertTrue(any("缺少柜台两腿持仓均价" in log for log in engine.logs), engine.logs)
+
+
+class TestSessionGate(unittest.TestCase):
+    """集合竞价 / 休市时段一律不发单，避免被柜台 40052 拒单后白丢一张止盈单。"""
+
+    def test_call_auction_blocks_sending(self) -> None:
+        strategy, _engine, _spread = make_strategy()
+        self.assertFalse(strategy._can_send(datetime(2026, 11, 2, 8, 59, 0)))
+        self.assertFalse(strategy._can_send(datetime(2026, 11, 2, 20, 59, 0)))
+        self.assertTrue(strategy._can_send(MOMENT))
+
+    def test_closed_session_blocks_sending(self) -> None:
+        strategy, _engine, _spread = make_strategy({"trading_sessions": "night_2300"})
+        self.assertTrue(strategy._can_send(datetime(2026, 11, 2, 22, 0, 0)))
+        self.assertFalse(strategy._can_send(datetime(2026, 11, 2, 23, 30, 0)))
+
+    def test_open_grace_blocks_exit_placement(self) -> None:
+        """时段开头 60s 内不挂平仓单：CTP 昨仓尚未就绪，报了会被拒（错误码 30）。"""
+        strategy, _engine, _spread = make_strategy({"trading_sessions": "night_2300"})
+        self.assertTrue(strategy._in_open_grace(datetime(2026, 11, 2, 9, 0, 5)))
+        self.assertTrue(strategy._in_open_grace(datetime(2026, 11, 2, 9, 0, 36)))
+        self.assertFalse(strategy._in_open_grace(datetime(2026, 11, 2, 9, 1, 30)))
+        self.assertFalse(strategy._in_open_grace(datetime(2026, 11, 2, 10, 0, 0)))
+
+    def test_open_grace_can_be_disabled(self) -> None:
+        strategy, _engine, _spread = make_strategy(
+            {"trading_sessions": "night_2300", "exit_place_grace": 0})
+        self.assertFalse(strategy._in_open_grace(datetime(2026, 11, 2, 9, 0, 1)))
+
+
+class TestExecutorLog(unittest.TestCase):
+    """初始化日志必须报**实际生效**的 executor，而不是未解析的原始字段。"""
+
+    def test_reports_resolved_executor_mode(self) -> None:
+        strategy, engine, _spread = make_strategy()
+        strategy.executor = "exchange_spread"     # 未解析的原始值
+        strategy.executor_mode = "two_leg"        # 实际生效
+        engine.reset_logs()
+        strategy.on_init()
+
+        logs = [log for log in engine.logs if log.startswith("执行器=")]
+        self.assertTrue(logs, engine.logs)
+        self.assertTrue(any("执行器=two_leg" in log for log in logs), logs)
+        self.assertFalse(any("执行器=exchange_spread" in log for log in logs), logs)
 
 
 if __name__ == "__main__":

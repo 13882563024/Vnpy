@@ -1,4 +1,4 @@
-"""跨期均值回归策略（vnpy_spreadtrading 载体）。
+﻿"""跨期均值回归策略（vnpy_spreadtrading 载体）。
 
 策略规则见 ``docs/plan/PLAN-spreadtrading-跨期均值回归策略实现.md``：
 
@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from datetime import datetime
 from vnpy.trader.constant import Direction, Status
 from vnpy.trader.object import BarData, TickData
 
+from vnpy_spreadtrading.base import EngineType
 from vnpy_spreadtrading.template import SpreadStrategyTemplate
 
 from execution.base import (
@@ -43,6 +45,7 @@ from execution.base import (
 from fees.calculator import FeeCalculator, KIND_CLOSE, spec_from_record
 from utils.calendar import (
     TradingSessions,
+    in_call_auction,
     trading_day_str,
     trading_days_between,
 )
@@ -89,7 +92,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
     layer_volume: float = 1.0
 
     # ---------------- 过滤器 ----------------
-    width_ticks: float = 1.0
+    width_ticks: float = 2.0               # 单腿一档宽度上限（tick）；主连价差常态 2 tick
     sync_seconds: float = 0.5
     min_depth: float = 1.0
     vr_max: float = 0.0
@@ -98,6 +101,9 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
 
     # ---------------- 平仓 ----------------
     stop_loss: float = 10000.0
+    # 是否启用**逐层价格止损**。关闭后仍保留时间止损与换月强平（那两条是仓位属性，
+    # 不是价格判断）；需要“只跑止盈、不砍浮亏”时把它设 False。
+    allow_stop_loss: bool = True
     max_hold_days: int = 10
     roll_entry_cutoff_days: int = 3
     roll_exit_days: int = 1
@@ -121,6 +127,18 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
 
     # ---------------- 实盘 ----------------
     live_trading: bool = False
+    # 是否由 spreadconsole 控制台托管：托管时 live_trading 由 start_all 在核对通过后
+    # 置 True，因此 on_start 阶段打印"只计算不发单"会是错的。
+    managed_by_console: bool = False
+    # 止盈单被拒/撤单后的重挂节奏：按逗号分隔的退避秒数，用完后停在最后一档；
+    # 累计终止达到 exit_retry_limit 次后转入「低频重试」，每 exit_retry_cooldown 秒
+    # 再试一次（0 = 关闭低频重试，熔断即当日不再重挂）。
+    exit_retry_backoff: str = "1,3,10"
+    exit_retry_limit: int = 5
+    exit_retry_cooldown: float = 1800.0
+    # 开盘后多少秒内不挂平仓单：CTP 在时段开头尚未完成“昨仓→可平”划分，
+    # 此时报平仓单会被拒（错误码 30 平仓量超过持仓量，2026-11-11 实测持续到 09:00:36）。
+    exit_place_grace: float = 60.0
     trading_sessions: str = ""
     warmup_days: int = 0
     # 最小预热门槛：样本数与实际覆盖时长都达标才允许开仓/加仓
@@ -134,8 +152,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         "max_positions", "layer_volume",
         "width_ticks", "sync_seconds", "min_depth", "vr_max",
         "max_clean_width_ticks", "max_clean_jump_ticks",
-        "stop_loss", "max_hold_days", "roll_entry_cutoff_days", "roll_exit_days",
+        "stop_loss", "allow_stop_loss", "max_hold_days",
+        "roll_entry_cutoff_days", "roll_exit_days",
         "exit_preplace", "min_exit_pnl_override", "fee_buffer", "target_round_mode",
+        "exit_retry_backoff", "exit_retry_limit", "exit_retry_cooldown", "exit_place_grace",
         "executor", "spread_offset_flag_width", "market_close_timeout",
         "entry_partial_timeout", "payup",
         "max_exit_per_tick", "close_only",
@@ -214,6 +234,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self.reserved_exit_orders: dict[str, str] = {}
         # 同理，已存在但本进程不认识的建仓/加仓委托：占住开仓槽位，避免重复加仓。
         self.reserved_open_orders: dict[str, str] = {}
+        # 止盈单重挂退避：tier_id -> 允许下一次挂单的时间戳
+        self._exit_retry_at: dict[str, float] = {}
+        # 当前决策时刻：回测/测试下让 exit_layer 内部的时段校验与本次决策对齐
+        self._decision_moment: datetime | None = None
 
     def _owned_algos(self) -> list:
         """查找本策略已有的真实算法（回测假引擎也可提供 algos）。"""
@@ -377,7 +401,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             f"({self.fee_spec.open:g}/{self.fee_spec.close_yesterday:g}/{self.fee_spec.close_today:g})"
         )
         self.write_log(
-            f"执行器={self.executor} 主动腿={self.cfg.active_symbol or '未配置'} "
+            f"执行器={self.executor_mode} 主动腿={self.cfg.active_symbol or '未配置'} "
             f"组合合约={self.cfg.exchange_spread or '未配置'}"
         )
         if self.min_exit_pnl_override > 0:
@@ -385,7 +409,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
 
     def on_start(self) -> None:
         self._rebuild_filters()
-        if not self.live_trading:
+        if not self.live_trading and not self.managed_by_console:
             self.write_log(
                 "当前为【只计算不发单】模式（live_trading=False）：日志会打印每层止盈目标价，"
                 "不会真的报单"
@@ -396,6 +420,11 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             f"退出配置：只平仓={self.close_only} 预挂止盈={self.exit_preplace} "
             f"平仓超时={self.market_close_timeout:g}s 开仓部分成交超时={self.entry_partial_timeout:g}s"
         )
+        if not self.allow_stop_loss:
+            self.write_log(
+                "价格止损已关闭（allow_stop_loss=False）：浮亏不会自动平仓，"
+                "只保留时间止损与换月强平；请自行管理回撤"
+            )
         self.write_log(
             f"策略启动 分层上限={self.max_positions} 层步长={self.layer_step:g} "
             f"止损/层={self.stop_loss_per_tier:g}元 时段={self.sessions.describe()}"
@@ -430,11 +459,12 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._refresh_contract_metrics()
         self._handle_new_trading_day(moment)
 
-        self.session_open = self.sessions.is_open(moment)
+        self.session_open = self.sessions.is_open(self._clock(moment))
         self._advance_state(moment)
 
         if not self.session_open:
-            # 非交易时段：不开不平，但仍要维护止盈挂单（例如收盘前补挂）
+            # 非交易时段：不开不平；止盈目标价照常刷新，但**不发单**——
+            # 集合竞价与休市的委托会被柜台直接拒掉（DCE 40052），发了也是白丢一张单。
             self._maybe_preplace_exit(moment)
             self._refresh_variables()
             return
@@ -479,7 +509,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             return
         self._last_status_log = now
 
-        target = self.layers[-1].target_spread if self.layers else 0.0
+        top = max(self.layers, key=lambda item: item.layer_index) if self.layers else None
+        target = top.target_spread if top is not None else 0.0
         self.write_log(
             f"状态 价差={snapshot.mid:.3f} bid={snapshot.bid_price:.3f} ask={snapshot.ask_price:.3f} "
             f"mean={self.mean:.3f} sd={self.sd:.3f} 方向={self.direction_text} "
@@ -635,7 +666,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         return self._legacy_leg_price(near) is not None and self._legacy_leg_price(far) is not None
 
     def adopt_legacy_position(self) -> bool:
-        """把启动前已存在的价差净仓接管成第 1 层（标记 adopted），用于补挂止盈。
+        """把启动前已存在的价差净仓接管成**若干层（每层 layer_volume 手）**，标记 adopted。
 
         不是无风险自动开仓：只在两腿仓位数量一致、能取得两腿均价时成立；
         接管后仍需人工核对，且只影响止损/止盈，不会反向开仓。
@@ -655,28 +686,138 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             self.write_log("旧持仓接管失败：两腿均价无法折算价差")
             return False
 
-        layer = PositionLayer(
-            direction=DIRECTION_LONG if net_pos > 0 else DIRECTION_SHORT,
-            volume=abs(net_pos),
-            avg_spread=entry,
-            near_price=float(near_price),
-            far_price=float(far_price),
-            open_trading_day=self.trading_day or "",
-            open_datetime=datetime.now(),
-            layer_index=1,
-            entry_mean=self.mean,
-            entry_sd=self.sd,
-            adopted=True,
-        )
-        self.layers.append(layer)
-        self.direction = layer.direction
+        direction = DIRECTION_LONG if net_pos > 0 else DIRECTION_SHORT
+        added = self._add_adopted_layers(direction, abs(net_pos), entry, near_price, far_price)
+        if not added:
+            return False
+        self.direction = direction
         self._refresh_variables()
+        layer_text = "、".join(layer.describe() for layer in added)
         self.write_log(
-            f"接管旧持仓：{layer.describe()} 价差={entry:g} "
+            f"接管旧持仓：{layer_text} 价差={entry:g} "
             f"（按柜台腿均价 {near.vt_symbol}={near_price:g} / {far.vt_symbol}={far_price:g}）"
         )
-        self._maybe_preplace_exit(layer.open_datetime)
+        self._maybe_preplace_exit(added[0].open_datetime)
         return True
+
+    def _add_adopted_layers(self, direction: int, volume: float, entry: float,
+                            near_price: float, far_price: float) -> list[PositionLayer]:
+        """按「每层 layer_volume 手」把接管的净仓拆成多层。
+
+        不能把整仓并成一层：``max_positions`` 数的是**层数**，并成一层等于把已占用
+        的坑位全部释放，于是又能再开 2 层（2026-11-17 实测：3 手并成「第1层 3手」
+        → 当天又开第2、3层 → 持仓涨到 5 手）。逐层拆分同时也让止盈按每层 1 手挂出。
+        """
+        volume = float(volume)
+        if volume <= 1e-9:
+            return []
+        lot = max(1.0, float(self.layer_volume or 1.0))
+        chunks = max(1, math.ceil(volume / lot - 1e-9))
+        base_index = max((layer.layer_index for layer in self.layers), default=0)
+        remaining = volume
+        added: list[PositionLayer] = []
+        for offset in range(chunks):
+            size = min(lot, remaining)
+            if size <= 1e-9:
+                break
+            layer = PositionLayer(
+                direction=direction,
+                volume=size,
+                avg_spread=entry,
+                near_price=float(near_price),
+                far_price=float(far_price),
+                open_trading_day=self.trading_day or "",
+                open_datetime=datetime.now(),
+                layer_index=base_index + offset + 1,
+                entry_mean=self.mean,
+                entry_sd=self.sd,
+                adopted=True,
+            )
+            self.layers.append(layer)
+            added.append(layer)
+            remaining -= size
+        return added
+
+    def local_layer_net(self) -> float:
+        """本地层账的方向化手数合计（无层时为 0）。"""
+        return self.direction * sum(layer.volume for layer in self.layers if layer.is_open)
+
+    def reconcile_legacy_position(self) -> float:
+        """把柜台净仓**超出**本地层账的部分接管理，返回补入的手数。
+
+        只在"柜台比本地多、两腿一致、能取到柜台两腿均价"时补层，绝不自动减层：
+        本地多于柜台通常意味着成交回报未到，自动减会掩盖真实敞口。
+        （2026-11-11 事故：柜台 2 手、本地只记 1 手，多出的 1 手没有任何策略管理。）
+
+        比较必须按**绝对值**来：空头时柜台仓位更大 = 净仓更负，用 ``net_pos - local``
+        判正负会把“柜台多 1 手空单”误读成“柜台少仓”，于是空头方向的补层永远失败
+        （2026-11-17 20:55：OI 柜台 -2 / 本地 -1，纠正报“不一致”，只能人工处理）。
+        """
+        net_pos = float(getattr(self.spread, "net_pos", 0) or 0)
+        local = self.local_layer_net()
+        if abs(net_pos) < 1e-9:
+            if abs(local) > 1e-9:
+                self.write_log(
+                    f"仓位对齐：柜台空仓、本地层账 {local:g}，"
+                    f"不自动减层（可能有成交未回报），请人工核对"
+                )
+            return 0.0
+        if abs(local) > 1e-9 and net_pos * local < 0:
+            self.write_log(
+                f"仓位对齐：柜台净仓 {net_pos:g} 与本地层账 {local:g} 方向相反，"
+                f"不自动补层；请人工逐层核对"
+            )
+            return 0.0
+        if abs(net_pos) <= abs(local) + 1e-9:
+            if abs(net_pos) < abs(local) - 1e-9:
+                self.write_log(
+                    f"仓位对齐：柜台净仓 {net_pos:g} 少于本地层账 {local:g}，"
+                    f"不自动减层（可能有成交未回报），请人工核对"
+                )
+            return 0.0
+
+        near = self.spread.legs.get(self.spread.variable_symbols.get("near", ""))
+        far = self.spread.legs.get(self.spread.variable_symbols.get("far", ""))
+        if near is None or far is None:
+            return 0.0
+        near_net = self._legacy_net_pos(near)
+        far_net = self._legacy_net_pos(far)
+        if abs(near_net - net_pos) > 1e-6 or abs(far_net + net_pos) > 1e-6:
+            self.write_log(
+                f"仓位对齐失败：两腿与价差净仓不符"
+                f"（{near.vt_symbol}={near_net:g} / {far.vt_symbol}={far_net:g}，净仓={net_pos:g}）"
+            )
+            return 0.0
+        near_price = self._legacy_leg_price(near)
+        far_price = self._legacy_leg_price(far)
+        if near_price is None or far_price is None:
+            self.write_log("仓位对齐失败：缺少柜台两腿持仓均价，无法生成接管层")
+            return 0.0
+        entry = float(near_price) - float(far_price)
+        if not entry:
+            self.write_log("仓位对齐失败：两腿均价无法折算价差")
+            return 0.0
+
+        # 按「每层手数」拆成多层：整仓并成一层会释放 max_positions 的坑位，
+        # 让策略当天还能再开 2 层（2026-11-17 实测持仓从 3 手涨到 5 手）。
+        volume = abs(net_pos) - abs(local)
+        if volume <= 1e-9:
+            return 0.0
+        direction = DIRECTION_LONG if net_pos > 0 else DIRECTION_SHORT
+        added = self._add_adopted_layers(direction, volume, entry, near_price, far_price)
+        if not added:
+            return 0.0
+        self.direction = added[0].direction
+        self._refresh_variables()
+        layer_text = "、".join(layer.describe() for layer in added)
+        self.write_log(
+            f"仓位对齐：补入 {volume:g} 手（柜台净仓 {net_pos:g} / 本地层账 {local:g}），"
+            f"{layer_text} 价差={entry:g}"
+            f"（按柜台腿均价 {near.vt_symbol}={near_price:g} / {far.vt_symbol}={far_price:g}）"
+        )
+        # 每层都挂一张止盈（_maybe_preplace_exit 内部逐层判断，通常 1 手/张）
+        self._maybe_preplace_exit(added[-1].open_datetime)
+        return volume
 
     def _resolve_executor(self) -> str:
         """显式策略参数优先，其余取注册表；组合不可用时拒绝隐式降级。"""
@@ -764,7 +905,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
 
     # ================================================================ 交易日
     def _handle_new_trading_day(self, moment: datetime) -> None:
-        day = trading_day_str(moment)
+        # 交易日同样用真实时钟：快照时间陈旧会让夜盘口径的“次日”先命中，
+        # 造成 11-12 → 11-11 的日切抖动（当日盈亏与委托占位被清两遍）。
+        current = self._clock(moment) or moment or datetime.now()
+        day = trading_day_str(current)
         if day == self.trading_day:
             return
 
@@ -781,7 +925,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             self.filters.reset()
             self.write_log(f"进入新交易日 {day}：归档旧委托，按当前持仓重挂止盈单")
             if self.layers:
-                self._maybe_preplace_exit(moment)
+                self._maybe_preplace_exit(current)
 
     def _archive_stale_algos(self) -> None:
         self.algoids.clear()
@@ -791,8 +935,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self.pending_close = None
         for layer in self.layers:
             layer.algoid = ""
+            layer.retry_count = 0          # 新交易日重新给重挂机会
             if layer.state == TierState.PENDING_RETRY:
                 layer.state = TierState.OPEN
+        self._exit_retry_at.clear()
 
     # ================================================================ 平仓判定
     def _check_exit(self, snapshot: SpreadSnapshot, moment: datetime) -> bool:
@@ -811,22 +957,21 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             return True
 
         exit_price = exit_spread_price(snapshot, self.direction)
-        if exit_price and self.size > 0:
-            # 2) 逐层止损
-            worst: PositionLayer | None = None
-            worst_pnl = 0.0
-            for layer in self.layers:
+        if self.allow_stop_loss and exit_price and self.size > 0:
+            # 2) 逐层止损：**从最高层（最新层）往下**找第一个触发阈值的层。
+            #
+            # 层序优先于“浮亏最大”：同一批加仓常出现多层同价（同一秒开出的第1、2层），
+            # 浮亏完全相等时按遍历顺序会退化成“最早层先平”，与止盈的“从最新层开始”
+            # 不一致（2026-11-17 22:59 焦炭实测：两层同为 84.5，先平了第1层）。
+            for layer in sorted(self.layers, key=lambda item: item.layer_index, reverse=True):
                 pnl = layer.unrealized_pnl(exit_price, self.size)
-                if pnl <= -self.stop_loss_per_tier and (worst is None or pnl < worst_pnl):
-                    worst = layer
-                    worst_pnl = pnl
-            if worst is not None:
-                self._request_close(
-                    [worst.tier_id],
-                    f"止损 {worst.describe()} 浮亏 {worst_pnl:.0f}≤{-self.stop_loss_per_tier:.0f}",
-                    moment,
-                )
-                return True
+                if pnl <= -self.stop_loss_per_tier:
+                    self._request_close(
+                        [layer.tier_id],
+                        f"止损 {layer.describe()} 浮亏 {pnl:.0f}≤{-self.stop_loss_per_tier:.0f}",
+                        moment,
+                    )
+                    return True
 
         # 3) 时间止损（整仓，按最早一层的开仓交易日算）
         first_day = min((layer.open_trading_day for layer in self.layers if layer.open_trading_day),
@@ -857,10 +1002,18 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._advance_state(moment)
 
     def _select_layers(self, tier_ids: list[str]) -> list[PositionLayer]:
+        """返回目标层，并按**从高到低**（最新层在前）排序。
+
+        “无论开平，都从最高层开始”：止盈只挂最新层，止损从最高层往下找，
+        整仓平仓（强平/时间止损）也按这个顺序扣减层账。
+        """
         if not tier_ids:
-            return [layer for layer in self.layers if layer.is_open]
-        wanted = set(tier_ids)
-        return [layer for layer in self.layers if layer.is_open and layer.tier_id in wanted]
+            selected = [layer for layer in self.layers if layer.is_open]
+        else:
+            wanted = set(tier_ids)
+            selected = [layer for layer in self.layers
+                        if layer.is_open and layer.tier_id in wanted]
+        return sorted(selected, key=lambda layer: layer.layer_index, reverse=True)
 
     # ================================================================ 开仓判定
     def _warmup_ready(self) -> bool:
@@ -913,8 +1066,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._last_close_guard_log = now
         target = layer.describe() if layer is not None else reason
         self.write_log(
-            f"暂缓挂平仓单：柜台未确认对应层级仓位（{target}）；"
-            f"等待持仓刷新后自动重试"
+            f"暂缓挂平仓单：柜台可平量不足（{target}）——可能已有平仓委托在途或成交未回报；"
+            f"等待持仓/委托刷新后自动重试"
         )
 
     def _check_entry(self, snapshot: SpreadSnapshot, moment: datetime) -> None:
@@ -931,7 +1084,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         if mean is None or sd is None or sd <= 0:
             return
 
-        layer_index = len(self.layers) + 1
+        top_index = max((layer.layer_index for layer in self.layers), default=0)
+        layer_index = top_index + 1
         threshold_units = float(self.entry_k) + float(self.layer_step) * (layer_index - 1)
         band = threshold_units * sd
 
@@ -1034,12 +1188,101 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             + (f" 算法={algoid}" if algoid else "")
         )
 
-    def _can_send(self) -> bool:
-        """是否允许真的报单（``trading`` 是模板的启动开关，``live_trading`` 是发单开关）。"""
-        return bool(self.trading and self.live_trading and not self.paused and
-                    self.executor_mode in (EXECUTOR_TWO_LEG, EXECUTOR_EXCHANGE_SPREAD) and
-                    (self.executor_mode != EXECUTOR_EXCHANGE_SPREAD or
-                     self.cfg.exchange_spread_vt_symbol))
+    def _can_send(self, moment: datetime | None = None) -> bool:
+        """是否允许真的报单（``trading`` 是模板的启动开关，``live_trading`` 是发单开关）。
+
+        除开关状态外还要求处于**可交易时段**：集合竞价（08:55–09:00 / 20:55–21:00）
+        与休市时段的委托会被柜台直接拒掉（DCE 返回 40052「该合约当前是集合竞价撮合」），
+        拒单后又不会自动重挂，等于白丢一张止盈单。
+        """
+        if not (self.trading and self.live_trading and not self.paused):
+            return False
+        if self.executor_mode not in (EXECUTOR_TWO_LEG, EXECUTOR_EXCHANGE_SPREAD):
+            return False
+        if (self.executor_mode == EXECUTOR_EXCHANGE_SPREAD
+                and not self.cfg.exchange_spread_vt_symbol):
+            return False
+        return self._session_tradable(moment)
+
+    def _session_tradable(self, moment: datetime | None = None) -> bool:
+        """当前（或给定时刻）是否落在可发单的交易时段内。
+
+        集合竞价与日切**一律用真实时钟判断**：快照时间取自两腿 tick，两腿不同步时会
+        停在上一时段（2026-11-10 08:59 实测：P/V 只有一条腿刷新，快照时间仍是昨天的
+        14:59，于是挂出的止盈单被柜台 40052 拒掉；2026-11-11 08:55 同一原因导致每个
+        价差先切到 11-12 交易日再切回 11-11，把当日盈亏和委托占位清了两遍）。
+        """
+        current = self._clock(moment)
+        if current is None:                 # 回测/测试没有可靠时刻：不做时段限制
+            return True
+        return self.sessions.is_open(current)
+
+    def _clock(self, moment: datetime | None = None) -> datetime | None:
+        """时段/日切判断用的时刻。
+
+        实盘一律用真实时钟；回测与测试优先用传入时刻，其次快照时间。都没有时返回
+        ``None``，表示"没有可靠时刻"——此时不做时段限制，避免测试结果受运行时钟影响。
+        """
+        if self._live_engine():
+            return datetime.now()
+        if moment is not None:
+            return moment
+        if self._snapshot is not None and self._snapshot.datetime is not None:
+            return self._snapshot.datetime
+        return self._decision_moment
+
+    def _live_engine(self) -> bool:
+        """是否运行在真实柜台环境（回测/测试返回 False）。"""
+        getter = getattr(self.strategy_engine, "get_engine_type", None)
+        if not callable(getter):
+            return False
+        try:
+            return getter() == EngineType.LIVE
+        except Exception:      # noqa: BLE001 - 引擎类型异常不应阻断行情处理
+            return False
+
+    def _exit_retry_delay(self, retry_count: int) -> float:
+        """第 ``retry_count`` 次终止后的重挂等待秒数（最后一档复用）。"""
+        raw = str(self.exit_retry_backoff or "").replace("，", ",")
+        delays: list[float] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                delays.append(max(0.0, float(part)))
+            except ValueError:
+                continue
+        if not delays:
+            return 0.0
+        index = min(max(retry_count, 1) - 1, len(delays) - 1)
+        return delays[index]
+
+    def _exit_retry_blocked(self, layer) -> bool:
+        """该层是否仍在重挂退避窗口内。"""
+        until = self._exit_retry_at.get(layer.tier_id, 0.0)
+        return time.time() < until
+
+    def _exit_cooldown_elapsed(self, layer) -> bool:
+        """熔断后是否已过低频重试间隔。``exit_retry_cooldown<=0`` 表示不做低频重试。"""
+        if float(self.exit_retry_cooldown or 0.0) <= 0:
+            return False
+        return not self._exit_retry_blocked(layer)
+
+    def _in_open_grace(self, moment: datetime | None = None) -> bool:
+        """是否处于交易时段开头的宽限期内（此时不报平仓单）。
+
+        时段开头 CTP 尚未完成“昨仓→可平”划分，报平仓单会被拒
+        （错误码 30 平仓量超过持仓量）。2026-11-11 实测该窗口持续到 09:00:36。
+        """
+        grace = float(self.exit_place_grace or 0.0)
+        if grace <= 0:
+            return False
+        current = self._clock(moment)
+        if current is None:
+            return False
+        elapsed = self.sessions.seconds_into_session(current)
+        return elapsed is not None and elapsed < grace
 
     def _margin_gate_reason(self) -> str:
         """全局已用资金上限；达到阈值后只拦截开仓/加仓，不影响平仓。"""
@@ -1219,10 +1462,30 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
 
     # ================================================================ 预挂止盈
     def _maybe_preplace_exit(self, moment: datetime | None = None) -> None:
-        layer = self.layers[-1] if self.layers else None
+        """只给**最新层**预挂止盈单：同一合约同一时刻只存在一个止盈单。
+
+        这是刻意的设计，不是遗漏：
+        - 逐层各挂一张会把可平量分摊掉，后挂的必然撞上「平仓量超过持仓量」（错误码 30）；
+        - 加仓时状态机要「先撤掉在挂止盈单」，多张单会让撤单/重挂时序变得不可控。
+
+        最新层平掉后由 ``_on_exit_filled`` 回调本方法，自然轮到下一层（LIFO），
+        所以每层都有自己的止盈，只是不同时刻只挂一张。
+        """
+        self._decision_moment = moment      # 供 exit_layer 内部的时段校验对齐
+        # 始终盯**最高层**（layer_index 最大），不依赖列表尾部的排列顺序。
+        layer = max(self.layers, key=lambda item: item.layer_index) if self.layers else None
         if layer is None:
             return
+        if not self.exit_preplace or not self._can_send(moment):
+            return
+        if self.pending_close is not None or self.pending_open is not None:
+            return
+        if self._inflight_jobs((AlgoKind.OPEN, AlgoKind.CLOSE)):
+            return
+        self._preplace_layer_exit(layer, moment)
 
+    def _preplace_layer_exit(self, layer: PositionLayer, moment: datetime | None) -> None:
+        """给（唯一允许挂单的）最新层挂止盈单。"""
         target = self._calc_layer_target(layer)
         if target is None:
             return
@@ -1233,20 +1496,22 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
                 f"（净利≥{self._layer_min_exit_pnl(layer):.0f}元 费用{self._layer_fee(layer):.2f}元）"
             )
 
-        if not self.exit_preplace or not self._can_send():
-            return
+        if self.exit_algoid:
+            return      # 同一合约已有止盈单在途，绝不挂第二张
         if self._reserved_exit_active(layer):
             return  # 柜台已有该层平仓委托，绝不再挂第二张
         if not self._close_covered(layer.direction, layer.volume):
             self._log_close_guard(layer)
             return
-        if self.exit_algoid or self.pending_close is not None or self.pending_open is not None:
-            return
-        if self._inflight_jobs((AlgoKind.OPEN, AlgoKind.CLOSE)):
-            return
-        if layer.state == TierState.PENDING_RETRY and layer.retry_count >= 3:
-            self.write_log(f"止盈单连续挂出失败 3 次，停止重挂：{layer.describe()}（请人工处理）")
-            return
+        if layer.state == TierState.PENDING_RETRY and layer.retry_count >= int(self.exit_retry_limit):
+            # 熔断后不再放弃：每 exit_retry_cooldown 秒再试一次（失败会重新熔断计时，
+            # 不会刷单）。2026-11-11 开盘 35 秒内熔断后，7 个持仓裸奔了 6 小时。
+            if not self._exit_cooldown_elapsed(layer):
+                return
+        if self._in_open_grace(moment):
+            return      # 时段开头的宽限期：CTP 昨仓未就绪，报了也是「平仓量超过持仓量」
+        if self._exit_retry_blocked(layer):
+            return      # 还在重挂退避窗口内，等下一轮
 
         algoid = self.exit_layer(self.spread, layer)
         if not algoid:
@@ -1360,7 +1625,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             far_price=far_price,
             open_trading_day=self.trading_day,
             open_datetime=self._snapshot.datetime if self._snapshot else datetime.now(),
-            layer_index=len(self.layers) + 1,
+            layer_index=max((item.layer_index for item in self.layers), default=0) + 1,
             entry_mean=self.mean,
             entry_sd=self.sd,
         )
@@ -1383,21 +1648,51 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             self.write_log("止盈成交但找不到对应层（请人工核对）")
             return
         if volume <= 0 or not filled:
-            self.write_log(f"止盈单未成交（{job.reason}），保持挂单等待目标价")
+            # 算法已终止（拒单 / 被动撤单 / 无成交收尾）：柜台此刻没有该层的止盈单，
+            # 必须放开占位，否则本层会永久失去止盈保护。
             layer.algoid = ""
+            layer.retry_count += 1
+            if layer.retry_count >= int(self.exit_retry_limit):
+                layer.state = TierState.PENDING_RETRY
+                cooldown = float(self.exit_retry_cooldown or 0.0)
+                if cooldown > 0:
+                    self._exit_retry_at[layer.tier_id] = time.time() + cooldown
+                    self.write_log(
+                        f"止盈单连续终止 {layer.retry_count} 次，转为低频重试"
+                        f"（{cooldown:g}s 后再试一次）：{layer.describe()}"
+                        f"（请核对柜台与合约状态）"
+                    )
+                else:
+                    self.write_log(
+                        f"止盈单连续终止 {layer.retry_count} 次，停止重挂：{layer.describe()}"
+                        f"（请核对柜台与合约状态）"
+                    )
+            else:
+                # 退避重挂：开盘瞬间昨仓未就绪，毫秒级连发会把重试预算一次烧光
+                # （2026-11-10 09:00 实测：3 次重试只用了 0.85 秒，随后全天熔断）。
+                delay = self._exit_retry_delay(layer.retry_count)
+                self._exit_retry_at[layer.tier_id] = time.time() + delay
+                self.write_log(
+                    f"止盈单未成交（{job.reason}），算法 {job.algoid} 已终止；"
+                    f"{delay:g}s 后重新挂出止盈单：{layer.describe()}"
+                )
             return
 
         closed = min(volume, layer.volume)
         realized = self._settle_layer(layer, closed, price, "逐层止盈")
+        self._exit_retry_at.pop(layer.tier_id, None)
         self.write_log(
             f"止盈成交 第{layer.layer_index}层 价差{price:g} 平{closed:g}手 净利{realized:.0f}元"
         )
         self._maybe_preplace_exit(self._snapshot.datetime if self._snapshot else None)
 
     def _on_close_filled(self, algo, job: AlgoJob, volume: float, price: float, filled: bool) -> None:
-        layers = self._select_layers(job.tier_ids) or [
-            layer for layer in self.layers if layer.is_open
-        ]
+        # 从最高层往下扣减：与止盈、止损的层序口径一致。
+        layers = self._select_layers(job.tier_ids) or sorted(
+            (layer for layer in self.layers if layer.is_open),
+            key=lambda layer: layer.layer_index,
+            reverse=True,
+        )
         if volume <= 0 or not filled:
             self.write_log(f"平仓未成交（{job.reason}）：algo {job.algoid} 成交 0 手，保持持仓")
             return
@@ -1559,3 +1854,4 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
     def get_data(self) -> dict:
         self._refresh_variables()
         return super().get_data()
+

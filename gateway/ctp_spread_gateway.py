@@ -119,6 +119,8 @@ class SpreadCtpTdApi(CtpTdApi):
         self._position_query_failed: bool = False
         # 解析不了的回报绝不能按无单/无成交处理；重连后再核柜台记录。
         self.reconciliation_event_error: str = ""
+        # 柜台登录回报里的权威交易日（YYYY-MM-DD）；空串表示柜台上尚未拿到
+        self.cabinet_trading_day: str = ""
         # 组合单回报可能缺方向/开平标志：用已知委托信息回填，避免终态回报被丢弃。
         self._known_fields: dict[str, tuple[Direction, Offset]] = {}
         self._order_cache: dict[str, OrderData] = {}
@@ -129,6 +131,12 @@ class SpreadCtpTdApi(CtpTdApi):
         self.orders_query_pending: bool = False
         self._orders_query_reqid: int | None = None
         self._orders_query_started_at: float = 0.0
+        # 柜台当日委托的完整快照。交易所的当日委托列表天然只含**当前交易日**，
+        # 所以它是判断“本地记录是否仍然有效”的唯一权威依据（本地时钟可能与柜台差一天）。
+        self.orders_snapshot: set[str] = set()
+        self.orders_snapshot_at: float = 0.0
+        self.orders_snapshot_ok: bool = False
+        self._orders_query_rows: set[str] = set()
         # "manual"=核对查询（发布快照）；"auto"=后台刷新 OMS 持仓（不动快照）。
         self._position_query_mode: str = "manual"
 
@@ -160,16 +168,43 @@ class SpreadCtpTdApi(CtpTdApi):
 
     def onFrontDisconnected(self, reason: int) -> None:
         self._abort_position_query()
+        self._abort_orders_snapshot()
         self._position_activity_generation += 1
         self.reconciliation_event_error = ""
         super().onFrontDisconnected(reason)
 
+    def _abort_orders_snapshot(self) -> None:
+        """断线/重登后柜台委托快照不再可信：作废，避免据此清理本地记录。"""
+        self.orders_query_pending = False
+        self._orders_query_reqid = None
+        self._orders_query_rows = set()
+        self.orders_snapshot = set()
+        self.orders_snapshot_at = 0.0
+        self.orders_snapshot_ok = False
+
     def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
-        # 即便账号名称相同，重连前的持仓快照也不能复用。
+        # 即便账号名称相同，重连前的持仓/委托快照也不能复用。
         self._abort_position_query()
+        self._abort_orders_snapshot()
         self._position_activity_generation += 1
         self.reconciliation_event_error = ""
         super().onRspUserLogin(data, error, reqid, last)
+        # 柜台回报里的 TradingDay 是权威交易日：夜盘登录时它已经是次一交易日，
+        # 而本地按自然时间推算不认法定节假日，两者可能不一致。存下来供上层优先使用。
+        error_id = 0
+        if isinstance(error, dict):
+            try:
+                error_id = int(error.get("ErrorID") or 0)
+            except (TypeError, ValueError):
+                error_id = 0
+        if not error_id:
+            trading_day = str((data or {}).get("TradingDay", "") or "").strip()
+            if len(trading_day) == 8 and trading_day.isdigit():
+                self.cabinet_trading_day = (f"{trading_day[:4]}-{trading_day[4:6]}"
+                                            f"-{trading_day[6:]}")
+                self.gateway.write_log(f"柜台交易日：{self.cabinet_trading_day}")
+            else:
+                self.cabinet_trading_day = ""
 
     def onRspError(self, error: dict, reqid: int, last: bool) -> None:
         if self.position_query_pending and reqid == self._position_query_reqid:
@@ -226,9 +261,12 @@ class SpreadCtpTdApi(CtpTdApi):
             raise RuntimeError("柜台上次委托查询尚未结束，请稍后再试")
         if not self.contract_inited or not symbol_contract_map:
             raise RuntimeError("柜台合约目录尚未就绪，无法发起委托查询")
+        self.orders_query_pending = True
+        self._orders_query_rows = set()
+        self.orders_snapshot_ok = False       # 新查询开始：旧快照立刻作废
+        self.orders_snapshot_at = 0.0
         self.reqid += 1
         self._orders_query_reqid = self.reqid
-        self.orders_query_pending = True
         self._orders_query_started_at = monotonic()
         result = self.reqQryOrder(
             {"BrokerID": self.brokerid, "InvestorID": self.userid}, self.reqid
@@ -236,6 +274,7 @@ class SpreadCtpTdApi(CtpTdApi):
         if result:
             self.orders_query_pending = False
             self._orders_query_reqid = None
+            self._orders_query_rows = set()
             raise PositionQueryError(result)
 
     def onRspQryOrder(self, data: dict, error: dict, reqid: int, last: bool) -> None:
@@ -244,14 +283,29 @@ class SpreadCtpTdApi(CtpTdApi):
         if error and error.get("ErrorID"):
             self.orders_query_pending = False
             self._orders_query_reqid = None
+            self._orders_query_rows = set()
+            self.orders_snapshot_ok = False
+            self.gateway.write_log(
+                f"柜台当日委托查询失败（ErrorID={error.get('ErrorID')}）："
+                f"{error.get('ErrorMsg', '')}；本地委托状态未知，不做清理")
             return
         if data and data.get("InstrumentID"):
+            # 先按原始字段记进快照：即使解析不出方向/开平（回报不完整），
+            # 也要算作“柜台上确实存在这笔委托”，避免被误判为已失效。
+            orderid = (f"{data.get('FrontID')}_{data.get('SessionID')}"
+                       f"_{data.get('OrderRef')}")
+            self._orders_query_rows.add(f"CTP.{orderid}")
             order = self._order_from_query(data)
             if order is not None:
                 self.gateway.on_order(order)
         if last:
+            self.orders_snapshot = set(self._orders_query_rows)
+            self.orders_snapshot_at = monotonic()
+            self.orders_snapshot_ok = True
             self.orders_query_pending = False
             self._orders_query_reqid = None
+            self.gateway.write_log(
+                f"柜台当日委托查询完成：{len(self.orders_snapshot)} 笔")
 
     def _order_from_query(self, data: dict):
         symbol = str(data.get("InstrumentID", ""))

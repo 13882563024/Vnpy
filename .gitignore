@@ -9,6 +9,7 @@ __pycache__/
 
 # 运行期产物 / 临时目录
 artifacts/
+exports/
 .dsh-acl/
 .acl-recovery/
 .reasonix/

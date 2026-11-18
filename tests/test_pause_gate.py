@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -217,7 +218,11 @@ class TestPauseGate(unittest.TestCase):
             algoid=algo.algoid, kind=AlgoKind.OPEN, direction=1,
             volume=2, layer_index=1, target_spread=-14.0, reason="测试开仓",
         )
-        strategy.on_spread_algo(algo)
+        # 本用例只验证"成交后会预挂止盈"，与会话时刻无关；把集合竞价判定固定为否，
+        # 否则在 08:55–09:00 / 20:55–21:00 跑测试会因真实时钟被判成不可发单。
+        with patch("strategies.cross_period_mean_reversion.in_call_auction",
+                   return_value=False):
+            strategy.on_spread_algo(algo)
         self.assertEqual(len(strategy.layers), 1)
         self.assertTrue(any("挂出止盈单" in message for message in strategy.strategy_engine.logs),
                         strategy.strategy_engine.logs)

@@ -130,7 +130,11 @@ class TestSpreadEngineWiring(unittest.TestCase):
         # 已存在 + 新建 必须覆盖 spreads.json 里的全部价差（允许上一次运行已保存过）
         self.assertEqual(len(result["created"]) + len(result["existing"]), expected)
         self.assertEqual(result["conflicts"], [])
-        self.assertEqual(len(self.spread_engine.get_all_spread_names()), expected)
+        # 配置里的价差必须全部注册；允许引擎里存在配置外的价差
+        # （vnpy 的 spread_trading_setting.json 会保留历史注册记录，
+        #  从 spreads.json 删掉条目后它仍可能被恢复，不影响交易）。
+        registered = set(self.spread_engine.get_all_spread_names())
+        self.assertEqual(set(load_spread_configs()) - registered, set())
         # 引擎必须真的 start 过，否则价差永远不会合成
         self.assertTrue(self.spread_engine.active)
 

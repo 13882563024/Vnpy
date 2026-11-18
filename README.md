@@ -195,8 +195,57 @@ VeighNa 的数据与配置**不在本仓库内**，默认落在 `C:\Users\<用�
 | `ctp_connect.json` | CTP 连接配置（含账号密码，勿外传） |
 | `vt_setting.json` | 全局设置 |
 | `log/` | 运行日志 |
+| `records/<交易日>/orders.csv` | **委托记录**（每次状态变化一行：提交中/未成交/全部成交/拒单…） |
+| `records/<交易日>/trades.csv` | **成交记录**（一笔成交一行） |
 
 该目录不在版本控制范围内。
+
+### 6.1 委托 / 成交记录
+
+运行期实时追加写，**崩溃、重启都不丢**；夜盘（21:00 之后）按
+`utils.calendar.trading_day_of` 归到次日交易日。开关在 `config/runtime.json`：
+
+```json
+{ "record_orders": true, "record_trades": true }
+```
+
+| 文件 | 列 |
+| --- | --- |
+| `orders.csv` | `datetime, trading_day, vt_orderid, vt_symbol, gateway, direction, offset, type, price, volume, traded, status, reference` |
+| `trades.csv` | `datetime, trading_day, tradeid, vt_orderid, vt_symbol, gateway, direction, offset, price, volume` |
+| `spread_trades.csv` | `datetime, trading_day, spread, vt_orderid, direction, offset, near_symbol, far_symbol, near_price, far_price, spread_price, volume, gateway` |
+
+**`spread_trades.csv` 就是"开仓价"所在**：把同一组合单的两条腿成交合成一行，
+`spread_price = near_price - far_price`，`direction` 标成
+`开多价差 / 开空价差 / 平多价差 / 平空价差`，一眼能看出每笔的开仓/平仓价差。
+只有 `spreads.json` 里登记的两腿价差才会合成；手动单腿会只出现在 `trades.csv` 里。
+
+去重口径：委托按 `(vt_orderid, status, traded, datetime)`——CTP 重连后会重推历史
+委托，重复的不会写第二行；成交按 `tradeid`。
+
+导出/汇总有两种方式：
+
+**界面**：「功能 → 行情数据」面板顶部的「**导出交易记录 CSV…**」——选起止交易日、可选按价差/合约过滤，点「导出」；
+默认输出到 `exports\trading_records\<日期>\`（起止不同则用 `<起>_<止>`），点「打开记录目录」可直接看原始落盘文件。
+
+**命令行**：
+
+```powershell
+# 看有哪些交易日、各自多少行
+.venv\Scripts\python.exe tools\export_trading_records.py --list
+
+# 导出某交易日到 exports\trading_records\<日期>\
+.venv\Scripts\python.exe tools\export_trading_records.py --date 2026-11-12
+
+# 合并一段区间
+.venv\Scripts\python.exe tools\export_trading_records.py --from 2026-11-01 --to 2026-11-13
+
+# 只看某个价差（子串匹配价差名或合约代码）
+.venv\Scripts\python.exe tools\export_trading_records.py --date 2026-11-12 --match PK
+```
+
+> 注意：程序**启动后**才开始记录，之前的历史委托/成交查不到（vnpy 的 OMS 只在内存里）。
+> 需要历史数据请到柜台结算单里取。
 
 ## 7. 已知风险
 
@@ -265,4 +314,45 @@ F:\workspace\Vnpy\
 费率表由 `tools\build_fee_table.py` 从 `docs\全品种手续费表_交易所标准_20260919(1).xlsx`
 生成 `fees\fee_table.json`（纯标准库解析，不新增依赖）。拿到期货公司实际加收后，直接覆盖
 该 json 即可，代码无需改动。
+
+## 10. 定时代理（交易日自动连接 / 核对 / 启停交易）
+
+收盘后 CTP 断开、策略随之停止，次日需要人工重连、重新核对才能再开。
+定时代理把这三步自动化：**连接 → 核对并纠正 → 开始交易**。
+
+配置在 `config/schedule.json`，也可以在价差交易窗口点「定时任务」用表格编辑。
+默认计划（周一到周五）：
+
+```json
+{
+  "enabled": true,
+  "tasks": [
+    {"time": "08:49", "days": [1, 2, 3, 4, 5], "action": "purge",     "note": "清理隔夜委托缓存"},
+    {"time": "08:50", "days": [1, 2, 3, 4, 5], "action": "connect",   "note": "连接 CTP"},
+    {"time": "08:55", "days": [1, 2, 3, 4, 5], "action": "reconcile", "note": "核对并纠正本地账"},
+    {"time": "08:58", "days": [1, 2, 3, 4, 5], "action": "start",     "note": "开始交易"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `time` | `HH:MM`；内部每 10 秒扫描一次，命中当分钟后执行 |
+| `days` | ISO 周几：1=周一 … 7=周日；支持 `"1-5"`、`"1,3,5"`、`"一,三,五"` |
+| `action` | `purge` / `connect` / `reconcile` / `start` / `stop` |
+| `enabled` | 单条任务开关；顶层 `enabled` 是总开关 |
+
+行为约定：
+
+- **`purge` 必须排在 `connect` 之前**：CTP 委托当日有效，程序跨日不重启时引擎 OMS 里
+  还留着昨天的"未成交"记录。不清掉的话，`_bind_existing_exit_orders` 会误以为止盈单
+  还挂在柜台，该层再也不补挂（2026-11-17 实测：11 个价差全天无单）。
+  清理只丢**非当前交易日**的委托/成交，并清空策略的柜台占位；交易运行中会自动跳过。
+- **同一任务当天只执行一次**，重启程序也不会重复触发（按「日期 + 时间 + 动作」去重）。
+- `connect` 读 `~/.vntrader/ctp_connect.json`；文件缺失时跳过并写日志，不会瞎连。
+- `reconcile` 依次：查资金 → 查持仓 → 确认核对 → `sync_all` 批量纠正。
+  **任何一步失败就停住**，不会带着未核对的账去开始交易。
+- `start` 前再次确认交易端与行情端都已连接，未连接则跳过。
+- 已在交易中时不会重复 `start`；未在交易中时不会 `stop`。
+- 只按周几判断，**不识别法定节假日**——长假需要手动关掉总开关或停用相关任务。
 

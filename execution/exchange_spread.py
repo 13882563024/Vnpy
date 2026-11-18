@@ -162,8 +162,24 @@ class ExchangeSpreadImpl:
             self.rejected_count += 1
             self.algo.write_log(
                 f"组合单被拒（第 {self.rejected_count} 次）：{order.symbol} "
-                f"offset={order.offset.value} 错误信息：{getattr(order, 'reference', '')}"
+                f"offset={order.offset.value} 报单引用={order.reference or '—'}"
+                f"（拒单原因见同一时刻 CTP 网关日志）"
             )
+        if order.status in (Status.REJECTED, Status.CANCELLED):
+            self._finish_if_dead()
+
+    def _finish_if_dead(self) -> None:
+        """委托全部终止后结束算法，把终态交回策略。
+
+        模板只在 ``stopped`` 时才把状态推到 CANCELLED，因此**被拒 / 被动撤单**的算法
+        会一直停在 RUNNING：策略侧等不到终态，``exit_algoid`` 与 ``layer.algoid``
+        也就永远不清空，止盈单一旦被拒就再也不会重挂（实盘表现为仓位裸奔）。
+        这里在确认没有在途委托后主动走 ``stop()``，让策略收到 CANCELLED 并重挂。
+        """
+        algo = self.algo
+        if self.active_order_ids or algo.paused or algo.stopped:
+            return
+        algo.stop()
 
     def on_tick(self, tick: TickData) -> None:
         return

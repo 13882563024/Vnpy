@@ -127,7 +127,7 @@ class SpreadSnapshot:
 class FilterParams:
     """过滤器参数（默认值取推荐文档）。"""
 
-    width_ticks: float = 1.0
+    width_ticks: float = 2.0               # 单腿一档宽度上限（tick）；主连价差常态 2 tick
     sync_seconds: float = 0.5
     min_depth: float = 1.0
     volume_ratio_max: float = 0.0          # 0 = 不启用
@@ -180,10 +180,13 @@ class FilterChain:
         tick = leg.pricetick or self.pricetick
         width = leg.width
         if tick > 0 and params.max_clean_width_ticks > 0:
-            if width > params.max_clean_width_ticks * tick + tick * 0.5:
+            limit = params.max_clean_width_ticks * tick + tick * 0.5
+            if width > limit:
+                # 把元和 tick 都说清楚：只说"4 > 5 tick"会让人以为 4<5 却仍被拦
                 return False, (
-                    f"脏数据:{leg.vt_symbol} 盘口宽度 {width:g} > "
-                    f"{params.max_clean_width_ticks:g} tick"
+                    f"脏数据:{leg.vt_symbol} 盘口宽度 {width:g} 元"
+                    f"（{width / tick:.1f} tick）> 上限 "
+                    f"{params.max_clean_width_ticks:g} tick（{limit:g} 元）"
                 )
 
         mid = leg.mid
@@ -218,7 +221,9 @@ class FilterChain:
             limit = params.width_ticks * tick
             if leg.quoted and leg.width > limit + tick * 0.5:
                 return False, (
-                    f"W{params.width_ticks:g}:{leg.vt_symbol} 盘口宽度 {leg.width:g} > {limit:g}"
+                    f"W{params.width_ticks:g}:{leg.vt_symbol} 盘口宽度 "
+                    f"{leg.width:g} 元（{leg.width / tick:.1f} tick）> "
+                    f"{params.width_ticks:g} tick（{limit:g} 元）"
                 )
         return True, None
 

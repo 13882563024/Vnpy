@@ -306,3 +306,81 @@ def flush_tick_recorder(recorder, log=None) -> int:
     if log:
         log(f"tick 落库收尾：补写 {written} 条；{recorder.stats.written} 条已入库")
     return written
+
+
+def attach_trade_recorder(
+    main_engine,
+    event_engine,
+    runtime=None,
+    *,
+    root=None,
+    log=None,
+):
+    """把委托/成交 CSV 记录挂到引擎上（按交易日分目录，重启不丢）。
+
+    ``runtime`` 为空时读 ``config/runtime.json``；``record_orders`` 与
+    ``record_trades`` 都为假时返回 None。与 tick 落库完全独立：
+    关掉 tick 采集不影响交易记录。
+    """
+    from vnpy.trader.event import EVENT_ORDER, EVENT_TRADE
+
+    from recorder.trade_recorder import TradeRecorder
+    from utils.runtime_config import load_runtime_config
+
+    config = runtime if runtime is not None else load_runtime_config()
+    write = log or main_engine.write_log
+
+    if not config.record_orders and not config.record_trades:
+        write("委托/成交记录已关闭（config/runtime.json 的 record_orders / record_trades）")
+        return None
+
+    kwargs = {"record_orders": config.record_orders,
+              "record_trades": config.record_trades,
+              "output": write}
+    if root is not None:
+        kwargs["root"] = root
+    # 价差定义：把同一组合单的两条腿合成一行，直接给出开仓/平仓价差
+    try:
+        from utils.spread_config import load_spread_configs
+
+        kwargs["spreads"] = {
+            name: (config_item.legs[0], config_item.legs[1])
+            for name, config_item in load_spread_configs().items()
+            if len(config_item.legs) == 2
+        }
+    except Exception as exc:      # noqa: BLE001 - 读不到配置就只记单腿
+        write(f"价差成交合成未启用（读取 spreads.json 失败：{exc}）")
+    recorder = TradeRecorder(**kwargs)
+
+    if config.record_orders:
+        def on_order(event) -> None:
+            recorder.on_order(event.data)
+        event_engine.register(EVENT_ORDER, on_order)
+    if config.record_trades:
+        def on_trade(event) -> None:
+            recorder.on_trade(event.data)
+        event_engine.register(EVENT_TRADE, on_trade)
+
+    write(f"{config.describe_records()}：按交易日写入 {recorder.root}")
+    try:
+        day_dir = recorder.ensure_day()
+        write(f"委托/成交记录当天目录：{day_dir}"
+              f"（orders.csv / trades.csv / spread_trades.csv）")
+    except Exception as exc:      # noqa: BLE001 - 预创建失败不影响后续写入
+        write(f"委托/成交记录目录预创建失败：{exc}")
+    return recorder
+
+
+def flush_trade_recorder(recorder, log=None) -> int:
+    """交易记录收尾（GUI 关窗、命令行 Ctrl+C 时调）。返回补写行数。"""
+    if recorder is None:
+        return 0
+    try:
+        written = recorder.flush()
+    except Exception as exc:  # noqa: BLE001 - 收尾失败不该拦住退出
+        if log:
+            log(f"委托/成交记录收尾失败：{exc!r}")
+        return 0
+    if log:
+        log(f"委托/成交记录收尾：补写 {written} 行；{recorder.stats.describe()}")
+    return written

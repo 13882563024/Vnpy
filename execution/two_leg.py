@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from vnpy.trader.constant import Direction
+from vnpy.trader.constant import Direction, Status
 from vnpy.trader.object import ContractData, OrderData, TickData
 from vnpy.trader.utility import round_to
 
@@ -183,6 +183,8 @@ class TwoLegMakerImpl:
         algo = self.algo
         if algo.paused or not algo.is_active():
             return
+        if order.status in (Status.REJECTED, Status.CANCELLED) and self._finish_if_dead():
+            return
         if self.has_active_orders():
             return
         if not self.is_hedge_finished():
@@ -237,3 +239,21 @@ class TwoLegMakerImpl:
 
     def is_order_finished(self) -> bool:
         return not self.has_active_orders()
+
+    def _finish_if_dead(self) -> bool:
+        """委托全部终止且两腿已平衡时结束算法，把终态交回策略。
+
+        模板只在 ``stopped`` 时才把状态推到 CANCELLED，因此**被拒 / 被动撤单**的算法
+        会一直停在 RUNNING：策略侧等不到终态，``exit_algoid`` 与 ``layer.algoid``
+        也就永远不清空，止盈单一旦被拒就再也不会重挂（实盘表现为仓位裸奔）。
+        这里确认没有在途委托且对冲已平后主动走 ``stop()``。
+
+        返回是否已经收尾；已收尾时调用方不应再继续本轮回报处理。
+        """
+        algo = self.algo
+        if algo.paused or algo.stopped:
+            return False
+        if self.has_active_orders() or not self.is_hedge_finished():
+            return False
+        algo.stop()
+        return True

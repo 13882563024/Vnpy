@@ -27,11 +27,13 @@ def _roll_forward_to_weekday(day: date) -> date:
 
 
 def trading_day_of(moment: datetime) -> date:
-    """把自然时间映射到所属交易日。
+    """把自然时间映射到所属交易日（夜盘归次日，跳过周末）。
 
-    夜盘（20:55 之后到次日凌晨 3:00 前）归入下一交易日，并跳过周末。
+    只有 **20:55 之后**新开的夜盘才滚到下一交易日。凌晨 00:00–03:00 是**前一晚夜盘的
+    延续**，交易日与前一天相同 —— 早先这里对凌晨也做了 +1 天，导致周二 00:30 被判成
+    周三（`night_0230` 这类品种的凌晨 tick 会归错交易日、触发错误的日切）。
     """
-    if moment.hour >= NIGHT_START_HOUR or moment.hour < NIGHT_END_HOUR:
+    if moment.hour >= NIGHT_START_HOUR:
         return _roll_forward_to_weekday(moment.date() + timedelta(days=1))
     return _roll_forward_to_weekday(moment.date())
 
@@ -221,3 +223,31 @@ class TradingSessions:
         for start, end in self.segments:
             parts.append(f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}")
         return " / ".join(parts)
+
+    def seconds_into_session(self, moment: datetime) -> float | None:
+        """距离当前所处交易时段开始过了多少秒；不在任何时段内返回 ``None``。
+
+        用途：开盘瞬间 CTP 的昨仓尚未完成“昨仓→可平”划分，此时报平仓单会被柜台
+        以 ``错误码 30 平仓量超过持仓量`` 拒掉（2026-11-10 09:00:00 实测），
+        需要在时段开头留一段宽限期再报平仓单。
+        """
+        seconds = (moment.hour * 3600 + moment.minute * 60 + moment.second
+                   + moment.microsecond / 1e6)
+        best: float | None = None
+        for start, end in self.segments:
+            start_s, end_s = start * 60, end * 60
+            if start <= end:
+                if start_s <= seconds < end_s:
+                    elapsed = seconds - start_s
+                else:
+                    continue
+            else:                           # 跨零点（如 21:00-01:00）
+                if seconds >= start_s:
+                    elapsed = seconds - start_s
+                elif seconds < end_s:
+                    elapsed = seconds + (24 * 3600 - start_s)
+                else:
+                    continue
+            if best is None or elapsed < best:
+                best = elapsed
+        return best

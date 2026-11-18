@@ -1,7 +1,7 @@
 """价差管理窗口的交易门禁；不调用 vn.py 会撤单的 stop_strategy。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from time import monotonic, time
 from typing import Any
 
@@ -50,6 +50,8 @@ class SpreadTradingControl:
         self._startup_query_done = False
         self._orders_restored = False
         self._recovered_orderids: set[str] = set()
+        # 恢复出来却查不到原始时间的委托：无法证明仍是当日有效单，按历史记录处理。
+        self._moment_unknown: set[str] = set()
         self._startup_pause()
 
     @property
@@ -60,6 +62,24 @@ class SpreadTradingControl:
     @property
     def last_reconciliation_at(self) -> datetime | None:
         return max(self.reconciled_contracts.values(), default=None)
+
+    def cabinet_trading_day(self) -> str:
+        """柜台登录回报里的权威交易日（``YYYY-MM-DD``）；拿不到时返回空串。"""
+        td = getattr(self._gateway(), "td_api", None)
+        value = str(getattr(td, "cabinet_trading_day", "") or "")
+        return value if len(value) == 10 else ""
+
+    def current_trading_day(self, now: datetime | None = None) -> str:
+        """当前交易日：**优先用柜台回报**，缺失时才按本地日历推算。
+
+        柜台认法定节假日，本地推算只跳周末；两者不一致时以柜台为准。
+        """
+        from utils.calendar import trading_day_of
+
+        cabinet = self.cabinet_trading_day()
+        if cabinet:
+            return cabinet
+        return trading_day_of(now or datetime.now()).isoformat()
 
     def is_reconciled(self, name: str) -> bool:
         if name in self.reconciled_contracts:
@@ -99,6 +119,124 @@ class SpreadTradingControl:
             if callable(writer):
                 writer("提示：核对/委托状态写入本地文件失败，重启后可能丢失这些记录")
 
+    def _engine_cache(self, attr: str):
+        """取引擎的 ``orders`` / ``trades`` 缓存字典（在 OmsEngine 上，不在 MainEngine）。
+
+        早先直接读 ``main_engine.orders`` 永远是 None，跨日清缓存从来没真正执行过
+        （2026-11-17 20:49 定时清理报“隔夜委托 0 笔”，而白天还挂着 7 张未成交
+        止盈单，20:55 核对因此全被判“旧算法仍在途”）。
+        """
+        getter = getattr(self.main_engine, "get_engine", None)
+        if callable(getter):
+            try:
+                engine = getter("oms")
+            except Exception:
+                engine = None
+            holder = getattr(engine, attr, None) if engine is not None else None
+            if isinstance(holder, dict):
+                return holder
+        holder = getattr(self.main_engine, attr, None)
+        return holder if isinstance(holder, dict) else None
+
+    def purge_stale_caches(self, *, now: datetime | None = None) -> dict[str, int]:
+        """清掉跨交易日的委托/成交缓存，让开盘前拿到干净状态。
+
+        CTP 委托**当日有效**：程序跨日不重启时，引擎 OMS 与本地快照仍留着昨天的
+        "未成交"委托。这些幽灵委托会让 ``_bind_existing_exit_orders`` 误以为止盈单
+        还挂在柜台上，于是该层再也不补挂（2026-11-17 实测：11 个价差全天无单）。
+
+        只丢**非当前交易日**的引擎委托；策略的柜台占位一并清空——连接后
+        ``restore_orders`` / 核对会按柜台真实回报重建。
+        """
+        from utils.calendar import trading_day_of
+
+        current = self.current_trading_day(now)
+        engine_dropped = 0
+        trade_dropped = 0
+        reserved_dropped = 0
+        algos_dropped = 0
+
+        orders = self._engine_cache("orders")
+        if isinstance(orders, dict):
+            for orderid, order in list(orders.items()):
+                moment = getattr(order, "datetime", None)
+                if moment is None or getattr(moment, "tzinfo", None) is None:
+                    # 时间不可信（本机时钟补的）：无法证明它属于当前交易日，按历史记录丢弃。
+                    orders.pop(orderid, None)
+                    engine_dropped += 1
+                    continue
+                if trading_day_of(moment).isoformat() == current:
+                    continue
+                orders.pop(orderid, None)
+                engine_dropped += 1
+
+        trades = self._engine_cache("trades")
+        if isinstance(trades, dict):
+            for key, trade in list(trades.items()):
+                moment = getattr(trade, "datetime", None)
+                if moment is not None and getattr(moment, "tzinfo", None) is not None:
+                    if trading_day_of(moment).isoformat() == current:
+                        continue
+                trades.pop(key, None)
+                trade_dropped += 1
+
+        # 缓存清完同步本地“已恢复委托”集合，避免留下指向已删委托的 id。
+        live_ids = set(orders) if isinstance(orders, dict) else set()
+        self._recovered_orderids &= live_ids
+        self._moment_unknown &= self._recovered_orderids
+
+        engine = getattr(self.spread_engine, "strategy_engine", None)
+        strategies = getattr(engine, "strategies", {}) if engine is not None else {}
+        for strategy in list(strategies.values()):
+            for field in ("reserved_exit_orders", "reserved_open_orders"):
+                holder = getattr(strategy, field, None)
+                if isinstance(holder, dict) and holder:
+                    reserved_dropped += len(holder)
+                    holder.clear()
+            algos_dropped += self._archive_stale_algo_slots(strategy, current)
+
+        self._remember_orders()      # 按清理后的 OMS 重建本地快照
+        return {"engine_orders": engine_dropped, "engine_trades": trade_dropped,
+                "reserved": reserved_dropped, "algos": algos_dropped}
+
+    def _archive_stale_algo_slots(self, strategy, current: str) -> int:
+        """把只剩旧交易日委托的算法占位从策略上摘掉，返回摘掉的数量。
+
+        不清会让 ``sync_spread_position`` 永远报“旧算法仍在途或状态未知”，
+        “核对并纠正”跨日后一次都成功不了。
+        """
+        from utils.calendar import trading_day_of
+
+        algoids = getattr(strategy, "algoids", None)
+        if not isinstance(algoids, set) or not algoids:
+            return 0
+        if not getattr(strategy, "paused", False):
+            return 0        # 运行中的算法不动，等它自己结束
+        algo_engine = getattr(self.spread_engine, "algo_engine", None)
+        algos = getattr(algo_engine, "algos", None)
+        total = len(algoids)
+        stale: list[str] = []
+        for algoid in list(algoids):
+            algo = algos.get(algoid) if isinstance(algos, dict) else None
+            if algo is None:
+                stale.append(algoid)          # 引擎里已经没有它，只剩本地占位
+                continue
+            orders = list((getattr(algo, "orders", None) or {}).values())
+            if not orders:
+                stale.append(algoid)
+                continue
+            if all(trading_day_of(moment).isoformat() != current
+                   for moment in (getattr(order, "datetime", None) for order in orders)
+                   if moment is not None):
+                stale.append(algoid)
+        for algoid in stale:
+            algoids.discard(algoid)
+        if stale and len(stale) == total:
+            archiver = getattr(strategy, "_archive_stale_algos", None)
+            if callable(archiver):
+                archiver()      # 全部是旧算法：连 jobs/exit_algoid 一并复位
+        return len(stale)
+
     def _remember_orders(self) -> None:
         """保存每个合约当前已知的未终结委托，重启后仍能看到“上次会话遗留”。"""
         records: dict[str, list] = {}
@@ -115,6 +253,7 @@ class SpreadTradingControl:
                 orderid = getattr(order, "vt_orderid", "")
                 if not orderid:
                     continue
+                moment = getattr(order, "datetime", None)
                 rows.append({
                     "orderid": orderid,
                     "vt_symbol": order.vt_symbol,
@@ -124,6 +263,10 @@ class SpreadTradingControl:
                     "traded": float(getattr(order, "traded", 0) or 0),
                     "price": float(getattr(order, "price", 0) or 0),
                     "status": getattr(getattr(order, "status", None), "value", ""),
+                    # 委托时间必须落盘：没有它就分不清“今天挂出、重启后仍在柜台”与
+                    # “昨天的单、CTP 当日有效已失效”，只能一律当历史记录丢掉，
+                    # 于是策略为整层重挂止盈单，撞上柜台的在途单（平仓量超过持仓量）。
+                    "datetime": moment.isoformat() if moment is not None else "",
                 })
             strategy = self._strategy(name)
             if strategy is not None:
@@ -143,6 +286,25 @@ class SpreadTradingControl:
                 records[name] = rows
         self._saved_orders = records
         self._persist()
+
+    def _restored_order_moment(self, row: dict) -> tuple[datetime, bool]:
+        """恢复委托用的时间戳：(时间, 是否为可信的原始时间)。
+
+        可信 = 带时区，说明它来自交易所/柜台回报。**没有时区的时间一律不可信**：
+        它要么是老版本状态文件缺字段时补的 ``datetime.now()``，要么是本机时钟写出来的。
+        本机时钟可能与柜台差一天（2026-11-17 实测：日志 11-17 21:4x，CTP 回报
+        11-18 21:2x），用这种时间去和柜台交易日比对，会把早已失效的隔夜单算成
+        “今天挂的、仍然有效”，于是不清、还去绑定止盈位，最后一张单都挂不出来。
+        """
+        text = str(row.get("datetime") or "").strip()
+        if text:
+            try:
+                moment = datetime.fromisoformat(text)
+            except ValueError:
+                pass
+            else:
+                return moment, moment.tzinfo is not None
+        return datetime.now(), False
 
     def restore_orders(self) -> int:
         """把上次会话的未了结委托恢复进 OMS 与价差路由。
@@ -193,6 +355,7 @@ class SpreadTradingControl:
                     status = Status(str(row.get("status", "")))
                 except (ValueError, KeyError):
                     continue  # 缺字段的记录只用于展示，不恢复成假委托
+                moment, moment_known = self._restored_order_moment(row)
                 order = OrderData(
                     gateway_name="CTP",
                     symbol=symbol,
@@ -205,12 +368,14 @@ class SpreadTradingControl:
                     volume=float(row.get("volume", 0) or 0),
                     traded=float(row.get("traded", 0) or 0),
                     status=status,
-                    datetime=datetime.now(),
+                    datetime=moment,
                 )
                 try:
                     oms.process_order_event(Event(EVENT_ORDER, order))
                 except Exception:
                     continue
+                if not moment_known:
+                    self._moment_unknown.add(order.vt_orderid)
                 if isinstance(mapping, dict) and order.vt_symbol in set(
                         spread.variable_symbols.values()):
                     # 只有单腿委托能直接更新价差账；组合合约成交由后续核对处理。
@@ -280,12 +445,37 @@ class SpreadTradingControl:
             active.append(SimpleNamespace(
                 vt_orderid=orderid, vt_symbol=vt_symbol,
                 direction=direction, offset=offset,
+                volume=float(row.get("volume", 0) or 0),
+                traded=float(row.get("traded", 0) or 0),
+                datetime=self._saved_row_moment(row),
             ))
             known.add(orderid)
         return active
 
+    @staticmethod
+    def _saved_row_moment(row: dict):
+        """本地记录里的委托时间；**没有时区**（本机时钟）时返回 None 表示不可信。"""
+        text = str(row.get("datetime") or "").strip()
+        if not text:
+            return None
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return moment if moment.tzinfo is not None else None
+
     def _bind_existing_exit_orders(self, name: str, config, strategy, spread) -> int:
-        """把柜台已有的组合平仓委托绑定到接管层，占住止盈位，避免重复挂单。"""
+        """把柜台已有的组合平仓委托绑定到（最新）接管层，占住止盈位，避免重复挂单。
+
+        **是否“当日有效”只由柜台委托快照判定**（:meth:`_prune_orders_absent_from_cabinet`
+        在绑定之前先把柜台已经没有的单清掉）。这里不再用 ``trading_day_of(委托时间)``
+        和柜台 TradingDay 比对：夜盘时柜台回报的 TradingDay 可能滞后一天，
+        该比较会把**今晚刚挂出、确实在柜台**的单全判成“隔夜”，于是每层都重挂一张
+        （2026-11-17 21:56 实测：9 个合约的新单全部被判隔夜、全部重挂）。
+
+        唯一保留的时间判断是“有没有可信时间戳”：本机时钟写的（无时区）时间不能
+        证明委托还在柜台，一律不绑定。
+        """
         if strategy is None or not hasattr(strategy, "reserved_exit_orders"):
             return 0
         from vnpy.trader.constant import Direction, Offset
@@ -293,11 +483,21 @@ class SpreadTradingControl:
         target = config.exchange_spread_vt_symbol
         layers = list(getattr(strategy, "layers", []) or [])
         bound = 0
+        skipped = 0
         for order in self._known_active_orders(name, config):
             if getattr(order, "vt_symbol", "") != target:
                 continue
             if getattr(order, "offset", None) not in (
                     Offset.CLOSE, Offset.CLOSETODAY, Offset.CLOSEYESTERDAY):
+                continue
+            moment = getattr(order, "datetime", None)
+            if moment is None or getattr(moment, "tzinfo", None) is None:
+                # 时间不可信（本机时钟补的或缺字段）：无法证明它仍挂在柜台，不绑定。
+                skipped += 1
+                continue
+            if self._clearly_stale(moment):
+                # 快照不可用时的兜底：明显早于当前交易日的单一定是隔夜失效单。
+                skipped += 1
                 continue
             direction = getattr(order, "direction", None)
             sign = 1 if direction == Direction.LONG else -1
@@ -305,16 +505,34 @@ class SpreadTradingControl:
                 layer for layer in layers
                 if sign * float(getattr(layer, "direction", 0) or 0) < 0
             ]
-            tier_id = matches[0].tier_id if len(matches) == 1 else ""
-            strategy.reserved_exit_orders[order.vt_orderid] = tier_id
+            if not matches:
+                skipped += 1        # 与任何层都不同向：不可能是平掉现有仓位的单
+                continue
+            layer = matches[-1]     # 只盯**最新层**：策略同一时刻只保留一张止盈单
+            remaining = (float(getattr(order, "volume", 0) or 0)
+                         - float(getattr(order, "traded", 0) or 0))
+            layer_volume = float(getattr(layer, "volume", 0) or 0)
+            if (remaining > 1e-9 and layer_volume > 1e-9
+                    and remaining > layer_volume + 1e-9):
+                # 剩余量大于最新层手数：这张单不是盯这一层的。绑上去会占住止盈位，
+                # 却按别的层量去平，最新层反而永远等不到自己的止盈单。
+                skipped += 1
+                continue
+            strategy.reserved_exit_orders[order.vt_orderid] = getattr(layer, "tier_id", "")
             bound += 1
-        if bound:
-            writer = getattr(self.main_engine, "write_log", None)
-            if callable(writer):
-                writer(
-                    f"{name}：已把柜台 {bound} 笔平仓委托绑定到接管层止盈位，"
-                    f"策略不会再为同一层补挂止盈单"
-                )
+        writer = getattr(self.main_engine, "write_log", None)
+        if bound and callable(writer):
+            writer(
+                f"{name}：已把柜台 {bound} 笔平仓委托绑定到最新层止盈位，"
+                f"策略不会再为这一层补挂止盈单"
+                + (f"（另有 {skipped} 笔隔夜/方向或手数不匹配的单未绑定，"
+                   f"请到柜台确认是否撤销）" if skipped else "")
+            )
+        elif skipped and callable(writer):
+            writer(
+                f"{name}：柜台 {skipped} 笔平仓委托未绑定（隔夜失效，或与最新层方向/手数不符）；"
+                f"策略会按最新层重新挂止盈单，请到柜台确认旧单是否撤销"
+            )
         return bound
 
     def _bind_existing_open_orders(self, name: str, config, strategy) -> int:
@@ -377,15 +595,107 @@ class SpreadTradingControl:
         if strategy is not None and hasattr(strategy, "algoids"):
             strategy.algoids.discard(algoid)
 
+    def _prune_orders_absent_from_cabinet(self, name: str, config) -> int:
+        """以柜台**当日委托快照**为准，清掉本地记录里“柜台已经没有”的委托。
+
+        CTP 委托当日有效，交易所的当日委托列表只含当前交易日，所以
+        ``ReqQryOrder`` 的返回集合就是唯一权威清单：本地还在、柜台没有，说明它属于
+        上一交易日（已随结算失效），或早已撤单/成交而回报丢失。
+
+        快照缺失、查询失败或过旧时**一条都不清**——宁可提示“状态未知”，也不能把
+        真实在途的单误删后重挂一张（那会变成超量平仓，只能等柜台用错误码 30 挡）。
+        """
+        td = getattr(self._gateway(), "td_api", None)
+        if td is None:
+            return 0
+        if not getattr(td, "orders_snapshot_ok", False):
+            self._log_orders_snapshot_missing(name)
+            return 0
+        at = float(getattr(td, "orders_snapshot_at", 0.0) or 0.0)
+        if not at or monotonic() - at > SNAPSHOT_MAX_AGE:
+            self._log_orders_snapshot_missing(name)
+            return 0
+        snapshot = set(getattr(td, "orders_snapshot", set()) or ())
+        symbols = set(config.legs + [config.exchange_spread_vt_symbol])
+        oms = None
+        try:
+            getter = getattr(self.main_engine, "get_engine", None)
+            if callable(getter):
+                oms = getter("oms")
+        except Exception:
+            oms = None
+        local = set(self._recovered_orderids)
+        local |= {str(row.get("orderid", ""))
+                  for row in (self._saved_orders.get(name) or [])}
+        dropped: list[str] = []
+        for orderid in sorted(local):
+            if not orderid or orderid in snapshot:
+                continue
+            order = getattr(oms, "orders", {}).get(orderid) if oms is not None else None
+            vt_symbol = getattr(order, "vt_symbol", "")
+            if vt_symbol and vt_symbol not in symbols:
+                continue        # 别的合约的委托，交给它自己的核对
+            dropped.append(orderid)
+        if not dropped:
+            return 0
+        strategy = self._strategy(name)
+        for orderid in dropped:
+            self._drop_recovered_algo(orderid, strategy)
+            self._recovered_orderids.discard(orderid)
+            self._moment_unknown.discard(orderid)
+            if oms is not None:
+                oms.orders.pop(orderid, None)
+                oms.active_orders.pop(orderid, None)
+            mapping = getattr(self.spread_engine, "order_spread_map", None)
+            if isinstance(mapping, dict):
+                mapping.pop(orderid, None)
+            if strategy is not None:
+                for field in ("reserved_exit_orders", "reserved_open_orders",
+                              "pause_order_reports", "pause_trade_reports"):
+                    holder = getattr(strategy, field, None)
+                    if isinstance(holder, dict):
+                        holder.pop(orderid, None)
+        rows = [row for row in (self._saved_orders.get(name) or [])
+                if str(row.get("orderid", "")) not in dropped]
+        if rows:
+            self._saved_orders[name] = rows
+        else:
+            self._saved_orders.pop(name, None)
+        writer = getattr(self.main_engine, "write_log", None)
+        if callable(writer):
+            writer(
+                f"{name}：柜台当前交易日委托里没有 {'、'.join(dropped)}，"
+                f"按隔夜失效清理本地记录（CTP 当日有效）"
+            )
+        return len(dropped)
+
+    def _log_orders_snapshot_missing(self, name: str) -> None:
+        """快照不可用时留痕：否则“为什么没清旧单”在日志里完全看不到。"""
+        now = time()
+        if now - getattr(self, "_last_order_snapshot_log", 0.0) < 30:
+            return
+        self._last_order_snapshot_log = now
+        writer = getattr(self.main_engine, "write_log", None)
+        if callable(writer):
+            writer(
+                f"{name}：柜台当日委托快照不可用（未查询、查询失败或已过期），"
+                f"本次不清理本地委托记录；请点“核对柜台状态”重新查询后再纠正"
+            )
+
     def _prune_stale_order_records(self, name: str, config, *,
                                    check_directions: bool = False) -> int:
         """核对纠正时自动清掉不属于当前仓位的旧委托记录。
 
         CTP 没有委托查询接口，重启前遗留的委托不会有任何新回报；用户点
-        “核对并纠正”即视为已人工核对。两种记录会被清掉：
-        1. 本次登录从未收到过回报的纯记忆记录；
-        2. ``check_directions`` 时，方向与当前所有层都同向的平仓单——
+        “核对并纠正”即视为已人工核对。三种记录会被清掉：
+        1. 本次登录从未收到过回报、且委托时间不在当前交易日的纯记忆记录；
+        2. ``check_directions`` 时，方向与当前所有层都同向的**非当日**平仓单——
            它不可能是在平掉现有仓位（常见于早已成交的历史止盈单）。
+
+        **当前交易日挂出、尚未终态的委托一律保留**：重启后 CTP 不会重推历史
+        回报，用“本次登录见过回报”当唯一判据的话，今晚刚挂、柜台仍有效的止盈单
+        必然被判 stale 清掉，策略于是为整层再挂一张，撞上柜台的在途单——
+        2026-11-17 21:04 重启后 12 张止盈单全被「平仓量超过持仓量」拒掉即此故。
         """
         td = getattr(self._gateway(), "td_api", None)
         seen = set(getattr(td, "live_seen_orderids", set()) or ()) if td is not None else set()
@@ -397,6 +707,10 @@ class SpreadTradingControl:
         except Exception:
             oms = None
         symbols = set(config.legs + [config.exchange_spread_vt_symbol])
+        saved_rows = {
+            str(row.get("orderid", "")): row
+            for row in (self._saved_orders.get(name) or [])
+        }
         stale: list[str] = []
         for orderid in list(self._recovered_orderids):
             order = getattr(oms, "orders", {}).get(orderid) if oms is not None else None
@@ -404,6 +718,10 @@ class SpreadTradingControl:
             if vt_symbol and vt_symbol not in symbols:
                 continue
             if orderid in seen:
+                continue
+            if self._has_trusted_moment(order, saved_rows.get(orderid)):
+                # 有柜台回报时间：它到底还在不在，由“柜台当日委托快照”判定
+                # （_prune_orders_absent_from_cabinet），这里不猜。
                 continue
             stale.append(orderid)
         if check_directions and oms is not None:
@@ -417,6 +735,8 @@ class SpreadTradingControl:
                 if getattr(order, "vt_symbol", "") not in symbols:
                     continue
                 if getattr(order, "offset", None) not in close_offsets:
+                    continue
+                if self._has_trusted_moment(order, saved_rows.get(orderid)):
                     continue
                 if not getattr(order, "is_active", lambda: False)():
                     stale.append(orderid)
@@ -436,16 +756,55 @@ class SpreadTradingControl:
             mapping = getattr(self.spread_engine, "order_spread_map", None)
             if isinstance(mapping, dict):
                 mapping.pop(orderid, None)
-        # 本地保存的记录只保留本次登录真正收到过回报的委托；其余视为历史记录。
+        # 本地记录只保留本次登录收到过回报的、或有可信时间戳的委托。
         rows = [
             row for row in (self._saved_orders.get(name) or [])
             if str(row.get("orderid", "")) in seen
+            or self._saved_row_moment(row) is not None
         ]
         if rows:
             self._saved_orders[name] = rows
         else:
             self._saved_orders.pop(name, None)
         return len(stale)
+
+    def _has_trusted_moment(self, order, row: dict | None) -> bool:
+        """委托是否带着**可信**时间戳（来自柜台/交易所回报，而非本机时钟）。
+
+        只用来区分“本机补的假时间”与“真实回报时间”：前者无法证明委托仍在柜台，
+        按历史记录清理；后者交给柜台委托快照判定，绝不用 ``trading_day_of`` 与
+        柜台 TradingDay 硬比——夜盘时柜台该字段可能滞后一天，比了会把今晚刚挂出的
+        单全判成“隔夜”（2026-11-17 21:56 实测：9 个合约的新单全部被判隔夜）。
+        """
+        if row is not None:
+            moment = self._saved_row_moment(row)
+            return moment is not None and not self._clearly_stale(moment)
+        moment = getattr(order, "datetime", None)
+        if moment is None or getattr(moment, "tzinfo", None) is None:
+            return False
+        if self._clearly_stale(moment):
+            return False
+        orderid = str(getattr(order, "vt_orderid", "") or "")
+        return not (orderid and orderid in self._moment_unknown)
+
+    def _clearly_stale(self, moment: datetime) -> bool:
+        """委托时间是否**明显**早于当前交易日（容差 1 个交易日）。
+
+        夜盘时柜台回报的 TradingDay 可能滞后一天，用“同一天”做判据会误伤今晚的单；
+        这里只拦截相差超过一天的情况（例如隔了好几天的历史止盈单）。真正的权威
+        判定仍是柜台当日委托快照。
+        """
+        from utils.calendar import trading_day_of
+
+        current = self.current_trading_day()
+        if not current:
+            return False
+        try:
+            current_date = date.fromisoformat(current)
+            day = trading_day_of(moment)
+        except (TypeError, ValueError):
+            return False
+        return (current_date - day).days > 1
 
     def clear_contract_orders(self, name: str) -> int:
         """只清理本机“该合约的委托记录”，不撤单、不动柜台。
@@ -579,6 +938,10 @@ class SpreadTradingControl:
 
         以 OMS 持仓（后台每 ~4 秒刷新）为准；查不到/方向不符就返回 False，
         宁可不挂平仓单，也不发出会被“平仓量超过持仓量”拒绝的委托。
+
+        **必须扣掉在途平仓委托**：CTP 的可用平仓量 = 持仓 − 已挂平仓未成交量。
+        只看持仓会让“整层重挂”通过本地校验（2026-11-17 21:05：柜台 5 手空、
+        已有 1 手止盈在途，策略仍报 5 手 → 拒单 30）。
         """
         from vnpy.trader.constant import Direction
 
@@ -590,17 +953,54 @@ class SpreadTradingControl:
             positions = self.main_engine.get_all_positions()
         except Exception:
             return False
-        signed = 0.0
+        near_long = near_short = far_long = far_short = 0.0
         for position in positions:
             symbol = getattr(position, "vt_symbol", "")
             if symbol not in (near, far):
                 continue
             is_long = getattr(position, "direction", None) == Direction.LONG
             value = float(getattr(position, "volume", 0) or 0)
-            signed += (value if is_long else -value) * (1 if symbol == near else -1)
+            if symbol == near:
+                near_long += value if is_long else 0.0
+                near_short += 0.0 if is_long else value
+            else:
+                far_long += value if is_long else 0.0
+                far_short += 0.0 if is_long else value
+        # 与价差引擎一致：可配对的腿仓取 min，而不是把两腿直接相加。
+        # 旧写法 near_long + far_short 在正常持仓下正好是可平量的 **2 倍**，
+        # 于是本地校验几乎必过，超量平仓单只能等柜台用错误码 30 挡下来。
+        signed = min(near_long, far_short) - min(near_short, far_long)
+        pending_buy, pending_sell = self._pending_close_volume(name, config)
         if direction > 0:
-            return signed + 1e-9 >= float(volume)
-        return signed - 1e-9 <= -float(volume)
+            available = signed - pending_sell      # 多头可平量 = 多头持仓 − 已挂卖出平仓
+        else:
+            available = -signed - pending_buy      # 空头可平量 = 空头持仓 − 已挂买入平仓
+        return available + 1e-9 >= float(volume)
+
+    def _pending_close_volume(self, name: str, config) -> tuple[float, float]:
+        """在途平仓委托已冻结的可平量，返回 (买入量, 卖出量)（价差手数）。
+
+        组合单与单腿单的手数口径一致（一腿一手），因此直接累计剩余未成交量。
+        """
+        from vnpy.trader.constant import Direction, Offset
+
+        symbols = set(config.legs + [config.exchange_spread_vt_symbol])
+        close_offsets = (Offset.CLOSE, Offset.CLOSETODAY, Offset.CLOSEYESTERDAY)
+        buy = sell = 0.0
+        for order in self._known_active_orders(name, config):
+            if getattr(order, "vt_symbol", "") not in symbols:
+                continue
+            if getattr(order, "offset", None) not in close_offsets:
+                continue
+            remaining = (float(getattr(order, "volume", 0) or 0)
+                         - float(getattr(order, "traded", 0) or 0))
+            if remaining <= 1e-9:
+                continue
+            if getattr(order, "direction", None) == Direction.LONG:
+                buy += remaining
+            else:
+                sell += remaining
+        return buy, sell
 
     def _startup_pause(self):
         # 即使注册表读取损坏，仍先暂停当前引擎所有本项目策略。
@@ -815,6 +1215,69 @@ class SpreadTradingControl:
             result.append({"symbol": symbol, "local": local, "cabinet": net,
                            "long": long, "short": short, "difference": net - local})
         return result
+
+    def _align_cabinet_positions(self) -> list[str]:
+        """把柜台**多出**的持仓补进本地账与策略层（只增不减），返回补过仓的价差。
+
+        与「核对纠正」的区别：不要求人工确认，但只处理唯一安全的情形——柜台比本地多、
+        两腿方向不冲突、且能取到柜台两腿均价。2026-11-11 的事故是柜台 2 手、本地只记
+        1 手，多出的 1 手没有任何策略管理；这一步就是把它补回来的。
+        """
+        aligned: list[str] = []
+        for name in sorted(self.enabled):
+            config = self.service.get(name)
+            spread = self.spread_engine.get_spread(name)
+            if config is None or spread is None:
+                continue
+            try:
+                strategy = self._strategy(name)
+            except Exception:      # noqa: BLE001 - 取不到策略就跳过该价差
+                continue
+            try:
+                if self._align_one_position(name, config, strategy, spread):
+                    aligned.append(name)
+            except Exception as exc:      # noqa: BLE001 - 单个价差失败不阻断启动
+                writer = getattr(self.main_engine, "write_log", None)
+                if callable(writer):
+                    writer(f"{name} 仓位自动对齐失败：{exc}；请人工核对柜台持仓")
+        return aligned
+
+    def _align_one_position(self, name: str, config: SpreadConfig, strategy, spread) -> bool:
+        """单个价差的差额接管：只补"柜台多、方向一致、有柜台均价"的部分。"""
+        legs = self._cabinet_leg_differences(config, spread)
+        if not legs:
+            return False
+        target: dict[str, float] = {}
+        for leg in legs:
+            local = float(leg["local"])
+            cabinet = float(leg["cabinet"])
+            if float(leg["long"]) > 1e-9 and float(leg["short"]) > 1e-9:
+                return False                       # 双向持仓：不动，交人工
+            if abs(cabinet - local) < 1e-9:
+                continue
+            if local and cabinet and (local > 0) != (cabinet > 0):
+                return False                       # 方向相反：不动，交人工
+            if abs(cabinet) <= abs(local):
+                return False                       # 柜台不多（本地多记须人工查）
+            target[leg["symbol"]] = cabinet
+        if not target:
+            return False
+
+        data_engine = getattr(self.spread_engine, "data_engine", None)
+        if data_engine is None or not callable(getattr(data_engine, "save_pos", None)):
+            return False
+        backup = {symbol: float(spread.leg_pos.get(symbol, 0) or 0) for symbol in config.legs}
+        for symbol, volume in target.items():
+            spread.leg_pos[symbol] = volume
+        spread.calculate_pos()
+        added = strategy.reconcile_legacy_position()
+        if added <= 0:
+            for symbol, volume in backup.items():      # 补层失败：还原本地账
+                spread.leg_pos[symbol] = volume
+            spread.calculate_pos()
+            return False
+        data_engine.save_pos()
+        return True
 
     def reconciliation_report(self) -> dict:
         """一次性汇总所有已管理合约的账户、委托、持仓和策略层账。
@@ -1114,8 +1577,11 @@ class SpreadTradingControl:
             )
 
         symbols = set(config.legs + [config.exchange_spread_vt_symbol])
+        # 权威依据：柜台当日委托快照。柜台没有的 = 上一交易日（已随结算失效）或已终结，
+        # 一律清掉本地记录；快照不可用时这一步什么都不做（交给下面的兜底规则）。
+        pruned = self._prune_orders_absent_from_cabinet(name, config)
         # 用户点“核对并纠正”即视为已人工核对：顺手清掉本次登录后从未有回报的旧委托记忆。
-        pruned = self._prune_stale_order_records(name, config)
+        pruned += self._prune_stale_order_records(name, config)
         blockers: list[str] = []
         try:
             active_orders = [
@@ -1198,8 +1664,15 @@ class SpreadTradingControl:
                 spread.leg_pos[symbol] = volume
             spread.calculate_pos()
             if not flat:
-                if strategy.layers and not self._adopted_layers_ok(name, spread, strategy):
-                    raise ManagedSpreadError("策略层账与柜台仓位不一致，需人工逐层核对；未做修改")
+                if strategy.layers and not self._layers_match_net(spread, strategy):
+                    # 层账与柜台净仓不符：先按差额补层（只增不减），补不上才要求人工。
+                    added = strategy.reconcile_legacy_position()
+                    if added <= 0 or not self._layers_match_net(spread, strategy):
+                        raise ManagedSpreadError(
+                            "策略层账与柜台仓位不一致，需人工逐层核对；未做修改")
+                # 净仓对得上但层结构被合并（如 5 手并成 1 层）：按每层 layer_volume 手重建，
+                # 否则止盈会整层重挂、且只占 1 个层位 → 还能再开 2 层。
+                self._normalize_adopted_layers(name, spread, strategy)
                 if not strategy.layers and not strategy.adopt_legacy_position():
                     raise ManagedSpreadError(
                         "柜台有真实持仓，但缺少两腿持仓均价，无法生成接管层；"
@@ -1320,7 +1793,83 @@ class SpreadTradingControl:
         net_pos = float(getattr(spread, "net_pos", 0) or 0)
         expected = sum(float(layer.direction) * float(layer.volume) for layer in layers)
         return (abs(net_pos) > 1e-9 and abs(expected - net_pos) < 1e-6
-                and not getattr(strategy, "pause_trade_reports", {}))
+                and not getattr(strategy, "pause_trade_reports", {})
+                and self._layers_well_formed(spread, strategy))
+
+    def _layers_well_formed(self, spread, strategy) -> bool:
+        """层结构是否符合「每层 layer_volume 手」。
+
+        净仓对得上但层结构被合并（如 5 手并成「第1层 5手」）时，挂单量、止损额
+        与 ``max_positions`` 坑位全是错的：止盈会整层重挂（5 手）或只挂 1 手，
+        且只占 1 个层位，策略还能再开 2 层。
+        """
+        import math
+
+        layers = [layer for layer in (getattr(strategy, "layers", []) or [])
+                  if getattr(layer, "is_open", True)]
+        if not layers:
+            return False
+        net_pos = float(getattr(spread, "net_pos", 0) or 0)
+        if abs(net_pos) < 1e-9:
+            return False
+        lot = max(1.0, float(getattr(strategy, "layer_volume", 1.0) or 1.0))
+        volumes = [float(getattr(layer, "volume", 0) or 0) for layer in layers]
+        if any(volume <= 1e-9 or volume > lot + 1e-9 for volume in volumes):
+            return False
+        if len(layers) != math.ceil(abs(net_pos) / lot - 1e-9):
+            return False
+        signs = {1 if float(getattr(layer, "direction", 0) or 0) > 0 else -1
+                 for layer in layers}
+        return signs == {1 if net_pos > 0 else -1}
+
+    def _normalize_adopted_layers(self, name: str, spread, strategy) -> bool:
+        """把“整仓并成一层”的接管层按每层 layer_volume 手重建，返回是否重建。
+
+        只动全部由接管产生的层；策略自己开仓建立的层保持原样（每层均价不同，
+        重建会改写止损/止盈基准）。
+        """
+        layers = [layer for layer in (getattr(strategy, "layers", []) or [])
+                  if getattr(layer, "is_open", True)]
+        if not layers or self._layers_well_formed(spread, strategy):
+            return False
+        if not all(getattr(layer, "adopted", False) for layer in layers):
+            return False
+        lot = max(1.0, float(getattr(strategy, "layer_volume", 1.0) or 1.0))
+        before = "、".join(layer.describe() for layer in layers
+                          if callable(getattr(layer, "describe", None)))
+        strategy.layers.clear()
+        if hasattr(strategy, "direction"):
+            strategy.direction = 0
+        if not strategy.adopt_legacy_position():
+            return False
+        writer = getattr(self.main_engine, "write_log", None)
+        if callable(writer):
+            writer(
+                f"{name}：层结构不规范（{before}），已按每层 {lot:g} 手重建为 "
+                f"{len(strategy.layers)} 层："
+                + "、".join(layer.describe() for layer in strategy.layers)
+            )
+        return True
+
+    def _layers_match_net(self, spread, strategy) -> bool:
+        """层账合计是否与价差净仓一致（**不要求**层是接管来的）。
+
+        与 ``_adopted_layers_ok`` 的区别：允许策略自己开仓建立的层，只要数量与
+        柜台净仓对得上、且没有待归属的暂停期成交。用于"核对并纠正"——
+        2026-11-11 的事故里本地是真实开仓层，`_adopted_layers_ok` 永远返回 False，
+        于是纠正被拒绝，多出的手数一直没人管。
+        """
+        layers = [layer for layer in (getattr(strategy, "layers", []) or [])
+                  if getattr(layer, "is_open", False)]
+        if not layers:
+            return False
+        if getattr(strategy, "pause_trade_reports", {}):
+            return False
+        net_pos = float(getattr(spread, "net_pos", 0) or 0)
+        if abs(net_pos) < 1e-9:
+            return False
+        expected = sum(float(layer.direction) * float(layer.volume) for layer in layers)
+        return abs(expected - net_pos) < 1e-6
 
     def _reserved_ids(self, strategy) -> set[str]:
         """已被柜台委托占用的槽位：这些委托/算法不再作为“阻止交易”的理由。"""
@@ -1432,6 +1981,7 @@ class SpreadTradingControl:
             raise ManagedSpreadError(f"本地与柜台持仓不一致或双向持仓：{details}；先核对并纠正，禁止开启交易")
         if getattr(spread, "net_pos", 0) or any(getattr(spread, "leg_pos", {}).values()):
             if not (self._adopted_layers_ok(name, spread, strategy)
+                    or self._layers_match_net(spread, strategy)
                     or self._can_adopt_legacy(strategy)):
                 raise ManagedSpreadError(
                     "引擎记录存在未核对的价差/单腿仓位；拒绝在空层账上重启。"
@@ -1657,6 +2207,9 @@ class SpreadTradingControl:
             raise ManagedSpreadError("总交易已经启动，禁止重复执行初始化")
         if not self.enabled:
             raise ManagedSpreadError("尚未开启任何合约的交易许可")
+        # 先把柜台多出的持仓补进本地账与策略层，否则 validate() 会直接以
+        # “本地少仓”拒绝启动，多出来的手数就一直没有策略管（2026-11-11 事故）。
+        self._align_cabinet_positions()
         checked: dict[str, SpreadConfig] = {}
         forced: dict[str, str] = {}
         for name in sorted(self.enabled):
@@ -1690,6 +2243,7 @@ class SpreadTradingControl:
         try:
             for name, config in checked.items():
                 strategy = self._strategy(name)
+                strategy.managed_by_console = True   # on_start 不再误报"只计算不发单"
                 strategy.pause_strategy()
                 strategy.live_trading = False
                 if not strategy.inited:
@@ -1702,13 +2256,19 @@ class SpreadTradingControl:
                 strategy._load_static_config()
                 strategy._refresh_contract_metrics()
                 spread = self.spread_engine.get_spread(name)
-                if (spread is not None and not strategy.layers
-                        and abs(float(getattr(spread, "net_pos", 0) or 0)) > 1e-9):
-                    if not strategy.adopt_legacy_position() and name not in forced:
+                if spread is not None and abs(float(getattr(spread, "net_pos", 0) or 0)) > 1e-9:
+                    # 差额接管：本地已有层时只补柜台多出的那部分（只增不减）
+                    strategy.reconcile_legacy_position()
+                    # 合并过的接管层在这里按每层 layer_volume 手重建（每层 1 手挂 1 张止盈）
+                    self._normalize_adopted_layers(name, spread, strategy)
+                    if not strategy.layers and name not in forced:
                         raise ManagedSpreadError(
                             f"{name} 存在旧持仓，但两腿仓位不一致或缺少持仓均价，无法自动接管"
                         )
                 if spread is not None and strategy.layers:
+                    # 柜台当日委托快照里没有的旧单 = 上一交易日失效，先清掉再绑，
+                    # 否则它会一直占着止盈位，策略挂不出新单。
+                    self._prune_orders_absent_from_cabinet(name, config)
                     # 启动前再绑一次：柜台已有平仓单时占住止盈位，避免重复挂单。
                     self._bind_existing_exit_orders(name, config, strategy, spread)
                 self._bind_existing_open_orders(name, config, strategy)
@@ -1725,6 +2285,12 @@ class SpreadTradingControl:
                 if name not in forced:
                     self.validate(name)
                 strategy.live_trading = True
+                writer = getattr(strategy, "write_log", None)
+                if callable(writer):
+                    writer(
+                        "实盘发单已开启（live_trading=True）：此后所有信号都会真实报单；"
+                        "如需纸面观察请先「停止交易」"
+                    )
                 started.append(name)
         except Exception:
             self.stop_all(reason="启动失败，全部策略已暂停")

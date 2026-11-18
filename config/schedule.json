@@ -1,0 +1,109 @@
+{
+  "enabled": true,
+  "tasks": [
+    {
+      "time": "08:49",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "purge",
+      "enabled": true,
+      "note": "清理隔夜委托缓存"
+    },
+    {
+      "time": "08:50",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "connect",
+      "enabled": true,
+      "note": "连接 CTP"
+    },
+    {
+      "time": "08:55",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "reconcile",
+      "enabled": true,
+      "note": "核对并纠正本地账"
+    },
+    {
+      "time": "08:58",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "start",
+      "enabled": true,
+      "note": "开始交易"
+    },
+    {
+      "time": "20:49",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "purge",
+      "enabled": true,
+      "note": "清理隔夜委托缓存"
+    },
+    {
+      "time": "20:50",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "connect",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "time": "20:55",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "reconcile",
+      "enabled": true,
+      "note": ""
+    },
+    {
+      "time": "20:58",
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "action": "start",
+      "enabled": true,
+      "note": ""
+    }
+  ]
+}

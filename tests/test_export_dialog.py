@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -13,6 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from vnpy.trader.constant import Direction, Offset  # noqa: E402
+
+from recorder.trade_recorder import TradeRecorder  # noqa: E402
+from tests.test_trade_recorder import make_order, make_trade  # noqa: E402
 from utils.spread_config import SpreadConfig  # noqa: E402
 
 A = SpreadConfig(name="A_2701_2703", display_name="DCE.SP a2701&a2703",
@@ -143,6 +148,164 @@ class TestExportDialog(unittest.TestCase):
             self.dialog._start()
         factory.assert_not_called()
         self.assertIn("没有勾选", self.dialog.progress_label.text())
+
+
+class TestExportDialogWorkerLifetime(unittest.TestCase):
+    """回归：worker 的 C++ 对象被 deleteLater 销毁后，Python 引用还在。
+
+    2026-11-13 报错：``RuntimeError: Internal C++ object (ExportWorker) already deleted``
+    —— 第二次点「开始导出」时 ``self._worker.isRunning()`` 访问了已销毁的对象。
+    """
+
+    def setUp(self) -> None:
+        from vnpy.trader.ui import QtWidgets
+
+        QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        from tickbrowser.ui.export_dialog import SpreadExportDialog
+
+        self.dialog = SpreadExportDialog(None, spreads=SPREADS,
+                                         default_day=date(2026, 11, 12))
+
+    def tearDown(self) -> None:
+        self.dialog.close()
+
+    @staticmethod
+    def _deleted_thread():
+        from shiboken6 import delete
+        from vnpy.trader.ui import QtCore
+
+        worker = QtCore.QThread()
+        delete(worker)          # 模拟 deleteLater 已生效
+        return worker
+
+    def test_deleted_worker_counts_as_not_running(self) -> None:
+        self.dialog._worker = self._deleted_thread()
+
+        self.assertFalse(self.dialog._worker_is_running())
+        self.assertIsNone(self.dialog._worker, "死引用应被清掉")
+
+    def test_start_after_deleted_worker_does_not_raise(self) -> None:
+        """死引用既不能让「开始导出」崩溃，也不能把新一轮导出挡掉。"""
+        class FakeSignal:
+            def connect(self, *_args, **_kwargs):
+                pass
+
+        class FakeWorker:
+            def __init__(self, *_args, **_kwargs):
+                self.progressed = FakeSignal()
+                self.done = FakeSignal()
+                self.failed = FakeSignal()
+                self.finished = FakeSignal()
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def isRunning(self):
+                return False
+
+            def deleteLater(self):
+                pass
+
+        created: list = []
+
+        def factory(*_args, **_kwargs):
+            worker = FakeWorker()
+            created.append(worker)
+            return worker
+
+        self.dialog._worker = self._deleted_thread()
+        with patch("tickbrowser.ui.export_dialog.ExportWorker", factory):
+            self.dialog._start()            # 不应抛 RuntimeError
+
+        self.assertEqual(len(created), 1, "死引用不应挡住新一轮导出")
+        self.assertTrue(created[0].started)
+
+    def test_close_after_deleted_worker_does_not_raise(self) -> None:
+        self.dialog._worker = self._deleted_thread()
+
+        self.dialog.close()
+
+    def test_on_worker_finished_clears_reference(self) -> None:
+        from vnpy.trader.ui import QtCore
+
+        worker = QtCore.QThread()
+        self.dialog._worker = worker
+
+        self.dialog._on_worker_finished()
+
+        self.assertIsNone(self.dialog._worker)
+
+
+class TestTradeExportDialog(unittest.TestCase):
+    """交易记录导出对话框：选日期 → 汇总成 CSV，无记录时给明确提示。"""
+
+    def setUp(self) -> None:
+        from vnpy.trader.ui import QtWidgets
+
+        QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(self.temp.name)
+        self.records = base / "records"
+        self.out = base / "exports"
+        recorder = TradeRecorder(root=self.records, batch_size=1000,
+                                 spreads={"A_2701_2703": ("a2701.DCE", "a2703.DCE")})
+        recorder.on_order(make_order("1"))
+        recorder.on_trade(make_trade("T1", symbol="a2701", orderid="9",
+                                     direction=Direction.LONG,
+                                     offset=Offset.OPEN, price=5210.0))
+        recorder.on_trade(make_trade("T2", symbol="a2703", orderid="9",
+                                     direction=Direction.SHORT,
+                                     offset=Offset.OPEN, price=5224.0))
+        recorder.flush()
+
+        from tickbrowser.ui.trade_export_dialog import TradeExportDialog
+
+        self.dialog = TradeExportDialog(None, record_root=self.records,
+                                        out_root=self.out)
+
+    def tearDown(self) -> None:
+        self.dialog.close()
+        self.temp.cleanup()
+
+    def test_overview_lists_recorded_days(self) -> None:
+        self.assertIn("2026-11-12", self.dialog.overview.toPlainText())
+
+    def test_export_writes_three_files(self) -> None:
+        from vnpy.trader.ui import QtCore
+
+        moment = QtCore.QDate(2026, 11, 12)
+        self.dialog.start_edit.setDate(moment)
+        self.dialog.end_edit.setDate(moment)
+
+        self.dialog._export()
+
+        text = self.dialog.result.toPlainText()
+        self.assertIn("导出完成", text)
+        self.assertTrue((self.out / "2026-11-12" / "orders.csv").exists())
+        self.assertTrue((self.out / "2026-11-12" / "trades.csv").exists())
+        self.assertTrue((self.out / "2026-11-12" / "spread_trades.csv").exists())
+
+    def test_export_without_records_reports_clearly(self) -> None:
+        from vnpy.trader.ui import QtCore
+
+        moment = QtCore.QDate(2026, 12, 31)       # 没有记录的日子
+        self.dialog.start_edit.setDate(moment)
+        self.dialog.end_edit.setDate(moment)
+
+        self.dialog._export()
+
+        self.assertIn("没有匹配", self.dialog.result.toPlainText())
+
+    def test_reversed_range_is_rejected(self) -> None:
+        from vnpy.trader.ui import QtCore
+
+        self.dialog.start_edit.setDate(QtCore.QDate(2026, 11, 13))
+        self.dialog.end_edit.setDate(QtCore.QDate(2026, 11, 12))
+
+        self.dialog._export()
+
+        self.assertIn("早于", self.dialog.result.toPlainText())
 
 
 if __name__ == "__main__":

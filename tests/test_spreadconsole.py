@@ -1,4 +1,4 @@
-"""价差管理 GUI 控制器的无柜台门禁与真实 Qt 生命周期测试。"""
+﻿"""价差管理 GUI 控制器的无柜台门禁与真实 Qt 生命周期测试。"""
 from __future__ import annotations
 
 import os
@@ -46,6 +46,12 @@ class MockStrategy:
             adopted=True, direction=1, volume=1, tier_id="tier-1",
             describe=lambda: "接管层"))
         return True
+
+    def reconcile_legacy_position(self):
+        """差额接管：测试替身里等同"补一层并返回补入手数"。"""
+        if self.layers:
+            return 0.0
+        return 1.0 if self.adopt_legacy_position() else 0.0
 
     def _reserved_exit_active(self, layer):
         tiers = {getattr(item, "tier_id", "") for item in self.layers}
@@ -118,6 +124,340 @@ class ControlTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_layers_match_net_accepts_real_open_layers(self):
+        """2026-11-11 事故回归：真实开仓层 + 接管层混在一起，也算与净仓一致。
+
+        旧判断 `_adopted_layers_ok` 要求所有层都是接管来的，导致"核对并纠正"对
+        本地真实持仓永远报"需人工逐层核对"，柜台多出的手数一直没人管。
+        """
+        self.spread.net_pos = 2
+        self.strategy.pause_trade_reports = {}
+        self.strategy.layers = [
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=False),
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=True),
+        ]
+
+        self.assertTrue(self.control._layers_match_net(self.spread, self.strategy))
+        self.assertFalse(self.control._adopted_layers_ok(
+            self.config.name, self.spread, self.strategy))
+
+    def test_layers_match_net_rejects_shortfall(self):
+        self.spread.net_pos = 2
+        self.strategy.pause_trade_reports = {}
+        self.strategy.layers = [
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=False),
+        ]
+
+        self.assertFalse(self.control._layers_match_net(self.spread, self.strategy))
+
+    def test_layers_match_net_rejects_pending_trades(self):
+        self.spread.net_pos = 1
+        self.strategy.pause_trade_reports = {"CTP.1": 1.0}
+        self.strategy.layers = [
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=True),
+        ]
+
+        self.assertFalse(self.control._layers_match_net(self.spread, self.strategy))
+
+    # ------------------------------------------------ 隔夜止盈委托不绑定（2026-11-17）
+    def _exit_order(self, orderid: str, moment):
+        from vnpy.trader.constant import Direction, Offset
+
+        return SimpleNamespace(
+            vt_orderid=orderid,
+            vt_symbol=self.config.exchange_spread_vt_symbol,
+            direction=Direction.LONG, offset=Offset.CLOSE, datetime=moment)
+
+    def test_overnight_exit_orders_are_not_bound(self):
+        """CTP 委托当日有效：跨日不重启时 OMS 里的昨日委托已失效，不能占住止盈位。"""
+        from datetime import datetime, timedelta
+
+        self.strategy.layers = [SimpleNamespace(
+            tier_id="t1", direction=-1, volume=1)]
+        self.strategy.reserved_exit_orders = {}
+        stale = self._exit_order(
+            "CTP.9_old", datetime.now().astimezone() - timedelta(days=7))
+        self.main.get_all_active_orders = lambda: [stale]
+
+        bound = self.control._bind_existing_exit_orders(
+            self.config.name, self.config, self.strategy, self.spread)
+
+        self.assertEqual(bound, 0)
+        self.assertEqual(self.strategy.reserved_exit_orders, {})
+
+    def test_same_day_exit_order_is_bound(self):
+        from datetime import datetime
+
+        self.strategy.layers = [SimpleNamespace(
+            tier_id="t1", direction=-1, volume=1)]
+        self.strategy.reserved_exit_orders = {}
+        fresh = self._exit_order("CTP.9_new", datetime.now().astimezone())
+        self.main.get_all_active_orders = lambda: [fresh]
+
+        bound = self.control._bind_existing_exit_orders(
+            self.config.name, self.config, self.strategy, self.spread)
+
+        self.assertEqual(bound, 1)
+        self.assertEqual(self.strategy.reserved_exit_orders, {"CTP.9_new": "t1"})
+
+    def test_local_clock_timestamp_is_not_bound(self):
+        """本机时钟写的时间（无时区）不能证明委托仍挂在柜台：不许占位。
+
+        2026-11-17 实测：本机时钟比柜台慢一天，21:01 挂的单被恢复成 11-17 21:23，
+        `trading_day_of` 算出来正好等于柜台交易日，于是隔夜失效单被当成有效止盈位，
+        策略一张单都挂不出来。
+        """
+        self.strategy.layers = [SimpleNamespace(
+            tier_id="t1", direction=-1, volume=1)]
+        self.strategy.reserved_exit_orders = {}
+        local = SimpleNamespace(
+            vt_orderid="CTP.local", vt_symbol=self.config.exchange_spread_vt_symbol,
+            direction=Direction.LONG, offset=Offset.CLOSE, volume=1, traded=0,
+            datetime=datetime.now())        # 无时区 = 本机时钟
+        self.main.get_all_active_orders = lambda: [local]
+
+        bound = self.control._bind_existing_exit_orders(
+            self.config.name, self.config, self.strategy, self.spread)
+
+        self.assertEqual(bound, 0)
+        self.assertEqual(self.strategy.reserved_exit_orders, {})
+
+    def test_current_trading_day_prefers_cabinet_value(self):
+        """柜台 TradingDay 是权威交易日：认节假日，本地推算只跳周末。"""
+        self.gateway.td_api.cabinet_trading_day = "2026-12-25"   # 圣诞假期
+        self.assertEqual(self.control.cabinet_trading_day(), "2026-12-25")
+        self.assertEqual(self.control.current_trading_day(), "2026-12-25")
+
+    def test_current_trading_day_falls_back_to_local_calendar(self):
+        from utils.calendar import trading_day_of
+
+        self.gateway.td_api.cabinet_trading_day = ""
+        moment = datetime(2026, 11, 16, 10, 0)
+        self.assertEqual(self.control.cabinet_trading_day(), "")
+        self.assertEqual(self.control.current_trading_day(moment),
+                         trading_day_of(moment).isoformat())
+
+    def test_cabinet_trading_day_ignores_malformed_value(self):
+        self.gateway.td_api.cabinet_trading_day = "20261225"
+        self.assertEqual(self.control.cabinet_trading_day(), "")
+
+    def test_purge_clears_overnight_orders_but_keeps_today(self):
+        """2026-11-17 事故：跨日不重启时引擎里还留着昨天的未成交委托。"""
+        from datetime import datetime, timedelta
+
+        from vnpy.trader.constant import Direction, Offset, OrderType, Status
+        from vnpy.trader.object import OrderData
+
+        def make(orderid: str, moment) -> OrderData:
+            return OrderData(
+                symbol="SP a2701&a2703", exchange=Exchange.DCE, orderid=orderid,
+                direction=Direction.LONG, offset=Offset.CLOSE,
+                type=OrderType.LIMIT, price=-14.0, volume=1.0,
+                status=Status.NOTTRADED, datetime=moment, gateway_name="CTP")
+
+        old = make("old", datetime.now() - timedelta(days=7))
+        new = make("new", datetime.now().astimezone())
+        self.main.orders = {old.vt_orderid: old, new.vt_orderid: new}
+        self.main.trades = {}
+        self.strategy.reserved_exit_orders = {"CTP.old": "t1"}
+
+        result = self.control.purge_stale_caches()
+
+        self.assertEqual(result["engine_orders"], 1)
+        self.assertEqual(result["reserved"], 1)
+        self.assertNotIn(old.vt_orderid, self.main.orders)
+        self.assertIn(new.vt_orderid, self.main.orders, "当日委托不能被误清")
+        self.assertEqual(self.strategy.reserved_exit_orders, {})
+
+    def test_purge_reads_oms_engine_caches(self):
+        """``orders`` / ``trades`` 在 OmsEngine 上：旧写法读 MainEngine 永远是 None，
+        于是跨日清缓存一次都没真正执行过（2026-11-17 “隔夜委托 0 笔”）。"""
+        from vnpy.trader.constant import OrderType, Status
+        from vnpy.trader.object import OrderData
+
+        def make(orderid: str, moment) -> OrderData:
+            return OrderData(
+                symbol="SP a2701&a2703", exchange=Exchange.DCE, orderid=orderid,
+                direction=Direction.LONG, offset=Offset.CLOSE,
+                type=OrderType.LIMIT, price=-14.0, volume=1.0,
+                status=Status.NOTTRADED, datetime=moment, gateway_name="CTP")
+
+        old = make("old", datetime.now() - timedelta(days=7))
+        new = make("new", datetime.now().astimezone())
+        oms = SimpleNamespace(orders={old.vt_orderid: old, new.vt_orderid: new}, trades={})
+        self.main.get_engine = lambda name: oms if name == "oms" else None
+
+        result = self.control.purge_stale_caches()
+
+        self.assertEqual(result["engine_orders"], 1)
+        self.assertNotIn(old.vt_orderid, oms.orders)
+        self.assertIn(new.vt_orderid, oms.orders, "当日委托不能被误清")
+
+    def test_purge_drops_overnight_algo_slots(self):
+        """跨日遗留的算法占位会让核对永远报“旧算法仍在途或状态未知”。"""
+        current = self.control.current_trading_day()
+        old = SimpleNamespace(orders={"CTP.1": SimpleNamespace(
+            datetime=datetime.now() - timedelta(days=1))})
+        fresh = SimpleNamespace(orders={"CTP.2": SimpleNamespace(datetime=datetime.now())})
+        self.spread_engine.algo_engine = SimpleNamespace(
+            algos={"old": old, "fresh": fresh})
+        self.strategy.paused = True
+
+        self.strategy.algoids = {"old", "fresh"}
+        dropped = self.control._archive_stale_algo_slots(self.strategy, current)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(self.strategy.algoids, {"fresh"}, "当日算法必须保留")
+
+        self.strategy.algoids = {"old"}
+        self.assertEqual(self.control._archive_stale_algo_slots(self.strategy, current), 1)
+        self.assertEqual(self.strategy.algoids, set())
+
+    def test_cabinet_covers_counts_pairable_legs_not_their_sum(self):
+        """可平量按两腿可配对数量取 min：旧写法把两腿相加，等于放大一倍。"""
+        self.main.get_all_positions = lambda: [
+            SimpleNamespace(vt_symbol=self.config.legs[0],
+                            direction=Direction.SHORT, volume=5),
+            SimpleNamespace(vt_symbol=self.config.legs[1],
+                            direction=Direction.LONG, volume=5),
+        ]
+
+        self.assertTrue(self.control._cabinet_covers(self.config.name, -1, 5))
+        self.assertFalse(self.control._cabinet_covers(self.config.name, -1, 6))
+        self.assertFalse(self.control._cabinet_covers(self.config.name, 1, 1))
+
+    def test_cabinet_covers_subtracts_pending_close_orders(self):
+        """柜台 5 手空、已有 1 手止盈在途 → 只能再平 4 手（2026-11-17 21:05 拒单 30）。"""
+        self.main.get_all_positions = lambda: [
+            SimpleNamespace(vt_symbol=self.config.legs[0],
+                            direction=Direction.SHORT, volume=5),
+            SimpleNamespace(vt_symbol=self.config.legs[1],
+                            direction=Direction.LONG, volume=5),
+        ]
+        self.main.get_all_active_orders = lambda: [SimpleNamespace(
+            vt_orderid="CTP.9_46", vt_symbol=self.config.exchange_spread_vt_symbol,
+            direction=Direction.LONG, offset=Offset.CLOSE, volume=1, traded=0)]
+
+        self.assertFalse(self.control._cabinet_covers(self.config.name, -1, 5))
+        self.assertTrue(self.control._cabinet_covers(self.config.name, -1, 4))
+
+    def test_layers_well_formed_rejects_merged_takeover_layer(self):
+        """净仓对得上但层被合并（5 手并成 1 层）不算“一致”，必须重建。"""
+        self.spread.net_pos = 5
+        self.strategy.layer_volume = 1
+        self.strategy.layers = [SimpleNamespace(
+            direction=1, volume=5, is_open=True, adopted=True,
+            describe=lambda: "第1层 多5手")]
+
+        self.assertFalse(self.control._layers_well_formed(self.spread, self.strategy))
+
+        rebuilt = []
+
+        def adopt():
+            self.strategy.layers = [
+                SimpleNamespace(direction=1, volume=1, is_open=True, adopted=True,
+                                describe=lambda: "第N层 多1手")
+                for _ in range(5)
+            ]
+            rebuilt.append(True)
+            return True
+
+        self.strategy.adopt_legacy_position = adopt
+        self.assertTrue(self.control._normalize_adopted_layers(
+            self.config.name, self.spread, self.strategy))
+        self.assertEqual(rebuilt, [True])
+        self.assertTrue(self.control._layers_well_formed(self.spread, self.strategy))
+
+    def test_layers_well_formed_keeps_real_open_layers(self):
+        """策略自己开的 3 层各 1 手就是规范结构，不能被重建。"""
+        self.spread.net_pos = 3
+        self.strategy.layer_volume = 1
+        self.strategy.layers = [
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=False,
+                            describe=lambda: "第N层 多1手")
+            for _ in range(3)
+        ]
+
+        self.assertTrue(self.control._layers_well_formed(self.spread, self.strategy))
+        self.assertFalse(self.control._normalize_adopted_layers(
+            self.config.name, self.spread, self.strategy))
+        self.assertEqual(len(self.strategy.layers), 3)
+
+    def test_binds_only_orders_matching_latest_layer_volume(self):
+        """只绑盯最新层的那张：剩余量大于最新层手数的单绑上去会平错量。"""
+        self.strategy.layers = [
+            SimpleNamespace(tier_id="t1", direction=-1, volume=1),
+            SimpleNamespace(tier_id="t2", direction=-1, volume=1),
+        ]
+        self.strategy.reserved_exit_orders = {}
+        big = SimpleNamespace(
+            vt_orderid="CTP.big", vt_symbol=self.config.exchange_spread_vt_symbol,
+            direction=Direction.LONG, offset=Offset.CLOSE, volume=3, traded=0,
+            datetime=datetime.now().astimezone())
+        small = SimpleNamespace(
+            vt_orderid="CTP.small", vt_symbol=self.config.exchange_spread_vt_symbol,
+            direction=Direction.LONG, offset=Offset.CLOSE, volume=1, traded=0,
+            datetime=datetime.now().astimezone())
+        self.main.get_all_active_orders = lambda: [big, small]
+
+        bound = self.control._bind_existing_exit_orders(
+            self.config.name, self.config, self.strategy, self.spread)
+
+        self.assertEqual(bound, 1)
+        self.assertEqual(self.strategy.reserved_exit_orders, {"CTP.small": "t2"})
+
+    def test_prunes_local_orders_absent_from_cabinet_snapshot(self):
+        """柜台当日委托快照里没有的本地记录 = 上一交易日失效单：清掉并释放止盈位。"""
+        self.strategy.reserved_exit_orders = {"CTP.old": "t1"}
+        self.control._saved_orders = {"A_2701_2703": [{
+            "orderid": "CTP.old", "vt_symbol": self.config.exchange_spread_vt_symbol,
+            "direction": "空", "offset": "平", "volume": 3, "traded": 0,
+            "price": 13, "status": "未成交",
+            "datetime": datetime.now().astimezone().isoformat()}]}
+        self.control._recovered_orderids = {"CTP.old", "CTP.keep"}
+        self.gateway.td_api.orders_snapshot_ok = True
+        self.gateway.td_api.orders_snapshot_at = monotonic()
+        self.gateway.td_api.orders_snapshot = {"CTP.keep"}
+        oms = SimpleNamespace(orders={}, active_orders={})
+        self.main.get_engine = lambda name: oms if name == "oms" else None
+
+        dropped = self.control._prune_orders_absent_from_cabinet(
+            self.config.name, self.config)
+
+        self.assertEqual(dropped, 1)
+        self.assertNotIn("CTP.old", self.control._recovered_orderids)
+        self.assertIn("CTP.keep", self.control._recovered_orderids)
+        self.assertNotIn("CTP.old", self.strategy.reserved_exit_orders,
+                         "失效单必须释放止盈位，否则策略永远不补挂")
+        self.assertNotIn("A_2701_2703", self.control._saved_orders)
+
+    def test_keeps_everything_without_cabinet_order_snapshot(self):
+        """没有柜台委托快照（查询失败/未查）时一条都不清，避免误删真实在途单。"""
+        self.control._recovered_orderids = {"CTP.old"}
+        self.gateway.td_api.orders_snapshot_ok = False
+        oms = SimpleNamespace(orders={}, active_orders={})
+        self.main.get_engine = lambda name: oms if name == "oms" else None
+
+        dropped = self.control._prune_orders_absent_from_cabinet(
+            self.config.name, self.config)
+
+        self.assertEqual(dropped, 0)
+        self.assertIn("CTP.old", self.control._recovered_orderids)
+
+    def test_stale_cabinet_order_snapshot_is_ignored(self):
+        """快照过旧（超过 SNAPSHOT_MAX_AGE）不能拿来清本地记录。"""
+        self.control._recovered_orderids = {"CTP.old"}
+        self.gateway.td_api.orders_snapshot_ok = True
+        self.gateway.td_api.orders_snapshot_at = monotonic() - 10_000
+        self.gateway.td_api.orders_snapshot = set()
+        oms = SimpleNamespace(orders={}, active_orders={})
+        self.main.get_engine = lambda name: oms if name == "oms" else None
+
+        dropped = self.control._prune_orders_absent_from_cabinet(
+            self.config.name, self.config)
+
+        self.assertEqual(dropped, 0)
+        self.assertIn("CTP.old", self.control._recovered_orderids)
 
     def test_stop_never_calls_engine_stop_or_cancel(self):
         self.control.enabled.add(self.config.name)
@@ -762,9 +1102,40 @@ class ControlTests(unittest.TestCase):
         self.control._saved_orders = {"A_2701_2703": [{
             "orderid": "CTP.9", "vt_symbol": self.config.exchange_spread_vt_symbol,
             "direction": "空", "offset": "平", "volume": 1, "traded": 0,
-            "price": -12, "status": "未成交"}]}
+            "price": -12, "status": "未成交",
+            "datetime": datetime.now().astimezone().isoformat()}]}
         self.control.sync_spread_position(self.config.name, force=True)
         self.assertIn("CTP.9", self.strategy.reserved_exit_orders)
+
+    def test_sync_keeps_same_day_exit_order_across_restart(self):
+        """2026-11-17 21:04 事故回归：21:01 挂出的止盈单跨进程重启后仍挂在柜台，
+        不能被当成历史记录清掉——否则策略为整层重挂止盈，撞上柜台在途单被拒 30。"""
+        self._stale_spread_and_snapshot()
+        self.spread.leg_pos = {self.config.legs[0]: 0, self.config.legs[1]: 0}
+        self.spread.net_pos = 0
+        self.gateway.td_api.position_snapshot_sides = {
+            "a2701": {"long": 1, "short": 0},
+            "a2703": {"long": 0, "short": 1},
+        }
+        self.control._saved_orders = {"A_2701_2703": [{
+            "orderid": "CTP.9_46", "vt_symbol": self.config.exchange_spread_vt_symbol,
+            "direction": "空", "offset": "平", "volume": 1, "traded": 0,
+            "price": -12, "status": "未成交",
+            "datetime": datetime.now().astimezone().isoformat()}]}
+        self.control._persist()
+        oms = SimpleNamespace(process_order_event=Mock(), active_orders={}, orders={})
+        self.main.get_engine = lambda name: oms if name == "oms" else None
+        self.gateway.td_api.live_seen_orderids = set()   # 重启后 CTP 不会重推回报
+        restarted = SpreadTradingControl(
+            self.main, self.spread_engine, self.service,
+            state_path=Path(self.temp.name) / "state.json")
+        restarted.restore_orders()
+        result = restarted.sync_spread_position(self.config.name, force=True)
+
+        self.assertIn("CTP.9_46", restarted._recovered_orderids)
+        self.assertIn("CTP.9_46", self.strategy.reserved_exit_orders,
+                      "当日委托必须占住止盈位，策略不能再挂第二张")
+        self.assertNotIn("清理了", result)
 
     def test_sync_prunes_orders_without_live_reports(self):
         self._stale_spread_and_snapshot()
@@ -897,7 +1268,8 @@ class ControlTests(unittest.TestCase):
         }
         self.main.get_all_active_orders = lambda: [SimpleNamespace(
             vt_symbol=self.config.exchange_spread_vt_symbol,
-            vt_orderid="CTP.9", direction=Direction.SHORT, offset=Offset.CLOSE)]
+            vt_orderid="CTP.9", direction=Direction.SHORT, offset=Offset.CLOSE,
+            volume=1, traded=0, datetime=datetime.now().astimezone())]
         self.control.sync_spread_position(self.config.name, force=True)
         self.assertIn("CTP.9", self.strategy.reserved_exit_orders)
         layer = self.strategy.layers[0]
@@ -1101,6 +1473,43 @@ class ControlTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("QT_QPA_PLATFORM") == "offscreen", "需显式 offscreen Qt")
 class WidgetTests(unittest.TestCase):
+    def _make_widget(self, master_running: bool):
+        QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        spread_engine = SimpleNamespace(strategy_engine=SimpleNamespace(strategies={}),
+                                        get_spread=lambda _: None)
+        engine = SimpleNamespace(get_engine=lambda _: spread_engine,
+            get_gateway=lambda _: None, spread_tick_recorder=None)
+        factory_patch = patch("spreadconsole.ui.widget.SpreadTradingControl")
+        factory = factory_patch.start()
+        self.addCleanup(factory_patch.stop)
+        control = factory.return_value
+        control.service.list.return_value = {}
+        control.master_running = master_running
+        control.md_ready.return_value = True
+        control.td_ready.return_value = True
+        widget = SpreadConsoleWidget(engine, None)
+        self.addCleanup(widget.close)
+        return widget, control
+
+    def test_close_window_keeps_strategy_running(self):
+        """2026-11-11 反馈：叉掉价差窗口后策略要留在后台继续跑。"""
+        widget, control = self._make_widget(master_running=True)
+
+        widget.close()
+
+        control.stop_all.assert_not_called()
+        self.assertTrue(control.master_running)
+
+    def test_reopen_shows_real_running_state(self):
+        """重开窗口时按钮必须反映真实状态，不能回落成「开始交易」。"""
+        widget, control = self._make_widget(master_running=True)
+
+        widget.close()
+        widget.master.setText("开始交易")     # 模拟界面初始文案
+        widget.show()                         # 触发 showEvent → 立即刷新
+
+        self.assertEqual(widget.master.text(), "停止交易")
+
     def test_widget_constructs_without_cabinet(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         spread_engine = SimpleNamespace(strategy_engine=SimpleNamespace(strategies={}),
@@ -1177,4 +1586,5 @@ class WidgetTests(unittest.TestCase):
         dialog._clear_leftovers()
         cleared.assert_called_once()
         dialog.close()
+
 

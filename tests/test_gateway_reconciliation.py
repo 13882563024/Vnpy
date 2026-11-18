@@ -247,6 +247,43 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(order.traded, 1)
         self.assertIn(order.vt_orderid, self.api.live_seen_orderids)
 
+    def test_order_query_freezes_cabinet_snapshot_on_last_report(self):
+        """查询完整结束才定格快照；本地据此判定“柜台已经没有的委托”是否失效。"""
+        self.api.gateway.on_order = Mock()
+        self.api.contract_inited = True
+        contract = SimpleNamespace(exchange=Exchange.DCE)
+        with patch.dict(symbol_contract_map, {"SP a2701&a2703": contract}):
+            with patch.object(self.api, "reqQryOrder", return_value=0):
+                self.api.query_orders()
+            self.assertFalse(self.api.orders_snapshot_ok, "查询中不能有可用快照")
+            reqid = self.api._orders_query_reqid
+            self.api.onRspQryOrder({
+                "InstrumentID": "SP a2701&a2703", "OrderStatus": "0",
+                "Direction": "0", "CombOffsetFlag": "1",
+                "FrontID": 9, "SessionID": 1, "OrderRef": 2,
+                "LimitPrice": -14, "VolumeTotalOriginal": 1, "VolumeTraded": 0,
+                "InsertDate": "20261105", "InsertTime": "10:00:00",
+                "OrderPriceType": "2", "TimeCondition": "1", "VolumeCondition": "1",
+            }, {}, reqid, False)
+            self.assertFalse(self.api.orders_snapshot_ok, "未收到末条回报前不算完整")
+
+            self.api.onRspQryOrder({}, {}, reqid, True)
+        self.assertTrue(self.api.orders_snapshot_ok)
+        self.assertEqual(self.api.orders_snapshot, {"CTP.9_1_2"})
+        self.assertGreater(self.api.orders_snapshot_at, 0.0)
+
+    def test_failed_order_query_invalidates_snapshot(self):
+        """查询报错时快照必须作废：宁可不清本地记录，也不能按半份数据误删。"""
+        self.api.contract_inited = True
+        with patch.dict(symbol_contract_map,
+                        {"SP a2701&a2703": SimpleNamespace(exchange=Exchange.DCE)}):
+            with patch.object(self.api, "reqQryOrder", return_value=0):
+                self.api.query_orders()
+            reqid = self.api._orders_query_reqid
+            self.api.onRspQryOrder({}, {"ErrorID": 7}, reqid, True)
+        self.assertFalse(self.api.orders_snapshot_ok)
+        self.assertEqual(self.api.orders_snapshot, set())
+
     def test_parent_accumulator_cleared_before_new_query(self):
         self.api.positions["stale"] = object()
         def query(_request, _reqid):

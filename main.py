@@ -23,11 +23,22 @@ from vnpy_riskmanager import RiskManagerApp
 from gateway.ctp_spread_gateway import SpreadCtpGateway
 from spreadconsole import SpreadConsoleApp
 from tickbrowser import TickBrowserApp
-from utils.engine_setup import attach_tick_recorder, flush_tick_recorder, setup_spread_trading
+from utils.engine_setup import (
+    attach_tick_recorder,
+    attach_trade_recorder,
+    flush_tick_recorder,
+    flush_trade_recorder,
+    setup_spread_trading,
+)
 
 
 def main() -> None:
     qapp = create_qapp()
+
+    # 监控面板的「时间」列补上日期（跨日复盘时分得清夜盘与日盘）
+    from utils.ui_patch import patch_time_cell_with_date
+
+    patch_time_cell_with_date()
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
@@ -67,6 +78,16 @@ def main() -> None:
     # 自有价差窗口复用同一个采集器；动态添加的腿可加入白名单。
     main_engine.spread_tick_recorder = recorder
     qapp.aboutToQuit.connect(lambda: flush_tick_recorder(recorder, main_engine.write_log))
+
+    # 委托/成交记录：按交易日写 CSV（~/.vntrader/records/<交易日>/），重启不丢
+    trade_recorder = None
+    try:
+        trade_recorder = attach_trade_recorder(main_engine, event_engine)
+    except Exception as exc:  # noqa: BLE001
+        main_engine.write_log(f"委托/成交记录启动失败：{exc}")
+    main_engine.trade_recorder = trade_recorder
+    qapp.aboutToQuit.connect(
+        lambda: flush_trade_recorder(trade_recorder, main_engine.write_log))
 
     window = MainWindow(main_engine, event_engine)
     window.showMaximized()

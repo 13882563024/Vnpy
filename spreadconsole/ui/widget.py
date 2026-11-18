@@ -8,6 +8,8 @@ from vnpy_spreadtrading import APP_NAME
 
 from fees.calculator import FeeCalculator, UNIT_FIXED, UNIT_RATE, spec_from_record
 from spreadconsole.control import SpreadTradingControl
+from spreadconsole.schedule_agent import ScheduleAgent
+from spreadconsole.ui.schedule_dialog import edit_schedule
 from utils.managed_spreads import ManagedSpreadError
 from utils.risk_limits import (
     RiskLimits,
@@ -15,6 +17,7 @@ from utils.risk_limits import (
     load_risk_limits,
     save_risk_limits,
 )
+from utils.schedule_plan import DEFAULT_SCHEDULE_PATH, SchedulePlan
 
 _FEE_CALC = FeeCalculator()
 
@@ -226,6 +229,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self._order_refresh_queued = False
         self._quote_name = None
         self._batch_sync = False
+        self._batch_retry_done = False
         self._position_query_attempts = 0
         self.setWindowTitle("价差交易 · 跨期合约管理")
         self.setMinimumSize(1050, 660)
@@ -244,6 +248,10 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(1000)
+        # 定时代理：连接 / 核对纠正 / 启停交易，配置在 config/schedule.json
+        self.schedule_agent = ScheduleAgent(
+            self.control, main_engine,
+            SchedulePlan.load(DEFAULT_SCHEDULE_PATH), DEFAULT_SCHEDULE_PATH)
 
     def _on_spread_event(self, event) -> None:
         """价差 tick 到达 → 立即更新报价行（只处理当前选中的价差）。"""
@@ -312,6 +320,8 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self.master.clicked.connect(self._toggle_master)
         self.risk_button = QtWidgets.QPushButton("全局风控")
         self.risk_button.clicked.connect(self._edit_risk_limits)
+        self.schedule_button = QtWidgets.QPushButton("定时任务")
+        self.schedule_button.clicked.connect(self._edit_schedule)
         self.reconcile = QtWidgets.QPushButton("核对柜台状态")
         self.reconcile.clicked.connect(self._confirm_reconciliation)
         self.repair_position = QtWidgets.QPushButton("纠正所选合约")
@@ -322,6 +332,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         header.addWidget(self.connection)
         header.addStretch()
         header.addWidget(self.risk_button)
+        header.addWidget(self.schedule_button)
         header.addWidget(self.reconcile)
         header.addWidget(self.repair_position)
         header.addWidget(self.repair_all)
@@ -481,6 +492,23 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "保存失败", str(exc))
+        self._refresh()
+
+    def _edit_schedule(self):
+        """编辑定时代理计划（config/schedule.json）。"""
+        plan = edit_schedule(self.schedule_agent.plan, self)
+        if plan is None:
+            return
+        try:
+            self.schedule_agent.plan = plan
+            self.schedule_agent.save()
+        except Exception as exc:      # noqa: BLE001 - 写入失败要让用户看见
+            QtWidgets.QMessageBox.warning(self, "保存定时任务失败", str(exc))
+            return
+        enabled = "已启用" if plan.enabled else "已停用"
+        self.notice.setText(
+            f"定时任务{enabled}（{len(plan.tasks)} 条）；{self.schedule_agent.describe_next()}"
+        )
         self._refresh()
 
     def _confirm_reconciliation(self, batch: bool = False):
@@ -687,6 +715,19 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         ok = [name for name, kind, _ in results if kind == "ok"]
         skip = [name for name, kind, _ in results if kind == "skip"]
         fails = [(name, message) for name, kind, message in results if kind == "fail"]
+        if fails and not self._batch_retry_done and all(
+                "快照" in message for _, message in fails):
+            # 用户看核对弹窗的这几秒里柜台又推了回报，持仓/委托快照按设计立即作废，
+            # 于是纠正被拒。这里自动重查一轮再纠正（只重试一次），
+            # 让“核对并纠正全部”真正一键完成，而不是每次都要手动再点。
+            self._batch_retry_done = True
+            self.notice.setText("柜台又有新回报，快照已失效：正在重新查询后再纠正…")
+            QtCore.QTimer.singleShot(
+                self.QUERY_GAP_MS,
+                lambda: self._confirm_reconciliation(batch=True),
+            )
+            return
+        self._batch_retry_done = False
         summary = f"核对并纠正完成：成功 {len(ok)}，无需处理 {len(skip)}"
         if fails:
             summary += f"，失败 {len(fails)}"
@@ -706,6 +747,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
                 self, "柜台查询中", "请等待本轮查询完成")
             return
         self.notice.setText("正在核对全部合约，确认后将自动纠正…")
+        self._batch_retry_done = False      # 用户手动触发：允许自动重查一轮
         self._confirm_reconciliation(batch=True)
 
     def _repair_selected_position(self):
@@ -1329,7 +1371,23 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self.status.setText(state + (" · " + error if error else ""))
         self._update_order_status()
 
+    def showEvent(self, event):
+        # 重新打开时立刻按真实状态刷新一次，不必等下一次 1 秒定时器，
+        # 避免按钮短暂显示成「开始交易」与实际运行状态不符。
+        super().showEvent(event)
+        try:
+            self._refresh()
+        except Exception:      # noqa: BLE001 - 刷新失败交给定时器下一轮处理
+            pass
+
     def closeEvent(self, event):
-        # 面板被关闭也不得留下不可见的策略继续发单；暂停不会撤既有委托。
-        self.control.stop_all(reason="关闭价差管理窗口")
+        # 面板只是展示层：关闭窗口**不**停止策略，后台继续按既定逻辑运行。
+        # 停止交易请点「停止交易」；退出主程序时策略随进程结束。
+        if self.control.master_running:
+            writer = getattr(self.main_engine, "write_log", None)
+            if callable(writer):
+                writer(
+                    "价差管理窗口已关闭：策略仍在后台运行；"
+                    "如需停止交易请重新打开窗口点「停止交易」"
+                )
         super().closeEvent(event)

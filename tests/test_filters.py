@@ -234,7 +234,8 @@ class TestEntryAllowedChain(unittest.TestCase):
         self.assertIsNone(result.blocked_by)
 
     def test_first_failure_short_circuits(self) -> None:
-        chain = FilterChain(FilterParams(volume_ratio_max=10), pricetick=1.0)
+        # 显式钉住 1 tick 阈值，避免测试随 FilterParams 默认值变化
+        chain = FilterChain(FilterParams(volume_ratio_max=10, width_ticks=1), pricetick=1.0)
         snap = snapshot(
             leg(bid=4000, ask=4003),                     # 宽度超标
             leg("A2701.DCE", 4001, 4002, volume=1),      # 成交量比也超标
@@ -265,6 +266,20 @@ class TestCalendar(unittest.TestCase):
         self.assertEqual(trading_day_of(datetime(2026, 11, 7, 2, 0)).isoformat(), "2026-11-09")
         # 日盘
         self.assertEqual(trading_day_of(datetime(2026, 11, 6, 10, 0)).isoformat(), "2026-11-06")
+
+    def test_early_morning_belongs_to_same_trading_day(self) -> None:
+        """回归：周二凌晨是周一夜盘的延续，交易日仍是周二，不能滚到周三。
+
+        早先 ``trading_day_of`` 对整个 0:00–3:00 都做了 +1 天，导致 ``night_0230``
+        这类品种的凌晨 tick 归错交易日、触发错误的日切。
+        """
+        self.assertEqual(trading_day_of(datetime(2026, 11, 17, 0, 30)).isoformat(),
+                         "2026-11-17")
+        self.assertEqual(trading_day_of(datetime(2026, 11, 17, 2, 29)).isoformat(),
+                         "2026-11-17")
+        # 同一交易日内的早盘前也必须是同一天
+        self.assertEqual(trading_day_of(datetime(2026, 11, 17, 8, 58)).isoformat(),
+                         "2026-11-17")
 
     def test_call_auction(self) -> None:
         self.assertTrue(in_call_auction(datetime(2026, 11, 6, 8, 59)))

@@ -72,6 +72,9 @@ class TickBrowserWidget(QtWidgets.QWidget):
         export_button = QtWidgets.QPushButton("导出价差 CSV…")
         export_button.setToolTip("按交易日导出：选中价差、后台执行，导出时仍可正常看行情")
         export_button.clicked.connect(self.export_spreads)
+        records_button = QtWidgets.QPushButton("导出交易记录 CSV…")
+        records_button.setToolTip("把委托 / 成交 / 价差成交记录按交易日汇总成 CSV")
+        records_button.clicked.connect(self.export_records)
 
         top = QtWidgets.QHBoxLayout()
         top.addWidget(QtWidgets.QLabel("视图"))
@@ -84,6 +87,7 @@ class TickBrowserWidget(QtWidgets.QWidget):
         top.addWidget(refresh_button)
         top.addSpacing(12)
         top.addWidget(export_button)
+        top.addWidget(records_button)
         top.addStretch()
 
         # 左侧合约列表
@@ -186,6 +190,21 @@ class TickBrowserWidget(QtWidgets.QWidget):
         dialog.setModal(False)      # 非模态 + 后台线程：导出时照常看行情、下单
         dialog.show()
         self._export_dialog = dialog
+
+    def export_records(self) -> None:
+        """打开交易记录导出对话框：委托 / 成交 / 价差成交按交易日汇总成 CSV。"""
+        from tickbrowser.ui.trade_export_dialog import TradeExportDialog
+
+        dialog = getattr(self, "_records_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
+        dialog = TradeExportDialog(self)
+        dialog.setModal(False)      # 非模态：导出时照常看行情、下单
+        dialog.show()
+        self._records_dialog = dialog
 
     def show_current(self) -> None:
         mode = self.mode_combo.currentText()
