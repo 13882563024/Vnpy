@@ -1,13 +1,13 @@
-"""跨期均值回归策略 · 实盘启动入口。
+"""跨期均值回归策略 · 只读行情与离线自检入口。
 
 做的事情（按顺序）：
 
 1. 把工作目录切到项目根（``SpreadStrategyEngine`` 用 ``Path.cwd()/strategies`` 发现策略类）；
-2. 只用 vnpy 的标准引擎栈：``MainEngine`` + ``SpreadTradingApp`` + ``SpreadCtpGateway``；
+2. 只用 vnpy 的标准引擎栈：``MainEngine`` + ``SpreadTradingApp`` + ``CtpMdOnlyGateway``；
 3. 按 ``config/spreads.json`` 注册价差（已有同名价差则复用并核对 legs）；
 4. **替换** ``SpreadAlgoEngine.algo_class = CrossPeriodAlgo`` 并断言替换成功（方案 R8 自检）；
 5. 为每个价差添加 ``CrossPeriodMRStrategy``，初始化并启动；
-6. 若给出 ``--live`` 且能读到 CTP 连接配置，则真实报单；否则只计算不发单（日志打印每层目标价）。
+6. 只计算不发单（日志打印每层目标价）；CLI 未接入逐笔核验，真实交易请求在创建引擎前被拒绝。
 
 常用命令::
 
@@ -17,8 +17,6 @@
     # 只计算不发单（连柜台拿行情，日志打印每层止盈目标价）
     .venv\\Scripts\\python.exe run_strategy.py --spread A_2611_2701
 
-    # 真实报单
-    .venv\\Scripts\\python.exe run_strategy.py --spread A_2611_2701 --live
 """
 
 from __future__ import annotations
@@ -41,7 +39,7 @@ from vnpy.trader.utility import extract_vt_symbol, load_json           # noqa: E
 from vnpy_spreadtrading import SpreadTradingApp                       # noqa: E402
 
 from execution.cross_period_algo import CrossPeriodAlgo               # noqa: E402
-from gateway.ctp_spread_gateway import SpreadCtpGateway               # noqa: E402
+from gateway.ctp_md_gateway import CtpMdOnlyGateway               # noqa: E402
 from strategies.cross_period_mean_reversion import CrossPeriodMRStrategy  # noqa: E402
 from utils.engine_setup import (                                      # noqa: E402
     attach_tick_recorder,
@@ -66,15 +64,15 @@ CONTRACT_WAIT_SECONDS = 60.0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="跨期均值回归策略实盘启动")
+    parser = argparse.ArgumentParser(description="跨期均值回归策略行情观察（无真实交易）")
     parser.add_argument("--spread", action="append", default=[],
                         help="要运行的价差名（可多次指定）；默认运行 config/spreads.json 全部")
     parser.add_argument("--setting", action="append", default=[],
                         help="覆盖策略参数，格式 key=value（可多次）")
     parser.add_argument("--live", action="store_true",
-                        help="真实报单；缺省只计算不发单（live_trading=False）")
+                        help="拒绝真实交易：CLI 尚未接入控制器逐笔核验")
     parser.add_argument("--md-only", action="store_true",
-                        help="只连行情前置（不连交易端、无法报单）：纸面观察 + 采集 tick")
+                        help="只连行情前置（已是默认行为）：纸面观察 + 采集 tick")
     parser.add_argument("--record", dest="record", action="store_true", default=None,
                         help="强制开启 tick 落库（默认按 config/runtime.json）")
     parser.add_argument("--no-record", dest="record", action="store_false",
@@ -85,7 +83,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="运行时长（分钟）；0 = 一直跑到 Ctrl+C")
     parser.add_argument("--list", action="store_true", help="只打印配置与自检结果，然后退出")
     parser.add_argument("--wait", type=float, default=CONTRACT_WAIT_SECONDS,
-                        help=f"等待合约查询完成的秒数（默认 {CONTRACT_WAIT_SECONDS:g}）")
+                        help=f"等待行情登录的秒数（默认 {CONTRACT_WAIT_SECONDS:g}）")
     return parser.parse_args(argv)
 
 
@@ -95,7 +93,12 @@ def parse_overrides(items: list[str]) -> dict:
         if "=" not in item:
             raise SystemExit(f"参数覆盖格式应为 key=value：{item}")
         key, value = item.split("=", 1)
-        overrides[key.strip()] = _coerce(value.strip())
+        key = key.strip()
+        if key in {"live_trading", "trading"}:
+            raise SystemExit(f"[错误] CLI 不接受交易开关覆盖 {key}：只计算不发单，尚未接入控制器逐笔核验")
+        if key not in CrossPeriodMRStrategy.parameters:
+            raise SystemExit(f"[错误] 未知策略参数：{key}")
+        overrides[key] = _coerce(value.strip())
     return overrides
 
 
@@ -315,6 +318,9 @@ def add_strategies(spread_engine, configs: dict[str, SpreadConfig], selected: li
         strategy_name = f"{STRATEGY_CLASS}_{name}"
         # 策略类默认值 → spreads.json 的 strategy 段 → 命令行 --setting
         setting = strategy_setting_for(config, overrides)
+        # 配置、兼容别名、已持久化实例均不能为此只读入口启用交易。
+        setting.pop("trading", None)
+        setting["live_trading"] = False
         if strategy_name in strategy_engine.strategies:
             # 复用已加载的实例（来自 spread_trading_strategy.json），参数以配置为准
             strategy_engine.edit_strategy(strategy_name, setting)
@@ -351,35 +357,26 @@ def detect_stopped_strategies(spread_engine, strategy_names: list[str],
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.live:
+        print("[拒绝] CLI --live 尚未接入控制器逐笔核验，不能真实交易。请移除 --live 以运行行情观察或离线自检。", file=sys.stderr)
+        return 1
+    setting = parse_overrides(args.setting)
     config_path = PROJECT_ROOT / "config" / "spreads.json"
     configs = load_spread_table(config_path)
-    overrides = parse_overrides(args.setting)
 
     problems = self_check(configs, args.spread)
     if args.list or args.no_connect:
         return 0 if problems == 0 else 1
 
-    if args.md_only and args.live:
-        print("[错误] --md-only 只用于观察（不连交易端、无法报单），不能与 --live 同时使用")
-        return 1
-
-    setting: dict = dict(overrides)
-    setting["live_trading"] = bool(args.live and not args.md_only)
     if args.close_only:
         setting["close_only"] = True
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
 
-    if args.md_only:
-        from gateway.ctp_md_gateway import CtpMdOnlyGateway
-
-        gateway = main_engine.add_gateway(CtpMdOnlyGateway)
-        gateway_name = gateway.gateway_name
-    else:
-        gateway = main_engine.add_gateway(SpreadCtpGateway)
-        gateway_name = gateway.gateway_name
-        gateway = gateway
+    # 无论是否显式传 --md-only，本入口都不创建交易 API。
+    gateway = main_engine.add_gateway(CtpMdOnlyGateway)
+    gateway_name = gateway.gateway_name
 
     spread_engine = main_engine.add_app(SpreadTradingApp)
 
@@ -400,14 +397,12 @@ def main(argv: list[str] | None = None) -> int:
     symbols = selected_symbols(configs, args.spread)
     warn_off_session(configs, args.spread)
 
-    if args.md_only:
-        # 纯行情模式：交易端完全不连，合约用 spreads.json 的乘数/最小变动自行登记。
-        # 必须在注册价差之前登记，否则 SpreadDataEngine 不会订阅这些合约。
-        registered = register_md_only_contracts(gateway, configs, symbols)
-        main_engine.write_log(
-            f"纯行情模式：已登记 {len(registered)} 个合约（不连接交易前置，无法报单）",
-            "StrategyRunner",
-        )
+    # 纯行情模式：必须在注册价差之前登记合约，否则 SpreadDataEngine 不会订阅。
+    registered = register_md_only_contracts(gateway, configs, symbols)
+    main_engine.write_log(
+        f"纯行情模式：已登记 {len(registered)} 个合约（不连接交易前置，无法报单）",
+        "StrategyRunner",
+    )
 
     # 接线：加载策略类 → 换掉吃单算法 → 启动价差引擎（注册 EVENT_TICK）→ 注册价差。
     # 其中「启动价差引擎」是命令行入口最容易漏的一步，漏了价差永远是 0。
@@ -420,17 +415,11 @@ def main(argv: list[str] | None = None) -> int:
         main_engine.close()
         return 1
 
-    if args.md_only:
-        main_engine.connect(connect_setting, gateway_name)
-        if not wait_md_login(gateway, args.wait):
-            main_engine.write_log(f"行情登录超时（{args.wait:g}s）", "StrategyRunner")
-            main_engine.close()
-            return 1
-    else:
-        main_engine.connect(connect_setting, gateway_name)
-        if not wait_for_contracts(main_engine, symbols, args.wait):
-            main_engine.write_log("警告：部分合约未加载，策略乘数/最小变动可能为 0", "StrategyRunner")
-        check_exchange_spread_contracts(main_engine, configs, args.spread)
+    main_engine.connect(connect_setting, gateway_name)
+    if not wait_md_login(gateway, args.wait):
+        main_engine.write_log(f"行情登录超时（{args.wait:g}s）", "StrategyRunner")
+        main_engine.close()
+        return 1
 
     strategy_names = add_strategies(spread_engine, configs, args.spread, setting)
     if not strategy_names:
@@ -458,10 +447,8 @@ def main(argv: list[str] | None = None) -> int:
     for strategy_name in strategy_names:
         spread_engine.start_strategy(strategy_name)
 
-    mode = "真实报单" if setting["live_trading"] else "只计算不发单"
-    connection = "仅行情前置" if args.md_only else "交易+行情前置"
     main_engine.write_log(
-        f"已启动策略：{', '.join(strategy_names)}（{mode}，{connection}）；Ctrl+C 退出",
+        f"已启动策略：{', '.join(strategy_names)}（只计算不发单，仅行情前置）；Ctrl+C 退出",
         "StrategyRunner",
     )
 

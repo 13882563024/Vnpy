@@ -38,7 +38,13 @@ class ExchangeSpreadImpl:
         self.spread_mode_reports: bool | None = None
         self.rejected_count: int = 0
         self.contract_missing: bool = False
-        self.cancel_started: int = 0
+        # 组合单串行发送。记录发单时已匹配的手数，将委托累计成交换算为
+        # 算法累计成交门槛（单腿回报不能把两腿数量直接相加）。
+        self.fill_baseline: dict[str, float] = {}
+        self.awaiting_fills: dict[str, float] = {}
+        self.cancelled_order = False
+        self.cancel_started: int | None = None
+        self.cancel_warned = False
 
     # ------------------------------------------------------------ 发单
     def start(self) -> None:
@@ -58,7 +64,7 @@ class ExchangeSpreadImpl:
 
     def send_order(self) -> None:
         algo = self.algo
-        if algo.paused:
+        if algo.paused or algo.stopped or not self.is_order_finished():
             return
         contract = algo.get_contract(self.vt_symbol)
         if contract is None:
@@ -77,12 +83,19 @@ class ExchangeSpreadImpl:
         price = round_to(self.current_price(), contract.pricetick or algo.spread.pricetick or 0.01)
         vt_orderids = algo.send_spread_order(contract, price, remaining, algo.direction)
         if not vt_orderids:
+            if getattr(algo, "is_gate_pending", lambda: False)():
+                return          # 还在逐笔核验里排队，没发出单是正常的
             algo.write_log(
                 f"组合单发送失败：{contract.symbol} {algo.direction.value} "
                 f"{remaining:g}@{price:g}偏移={algo.offset.value}"
             )
+            # 发送路径直接返回空（闸门拒发/没拿到本地单号）时不会再有委托回报，
+            # 算法会一直挂着、策略以为止盈已挂。这里主动收尾，让策略拿到终态重挂。
+            self._finish_if_dead()
             return
 
+        for vt_orderid in vt_orderids:
+            self.fill_baseline[vt_orderid] = self.traded_volume
         self.order_ids.extend(vt_orderids)
         self.active_order_ids.update(vt_orderids)
         algo.write_log(
@@ -92,31 +105,52 @@ class ExchangeSpreadImpl:
         )
 
     # ------------------------------------------------------------ 回报
+    def accept_sent_order(self, vt_orderid: str) -> None:
+        """逐笔核验通过后才真正发出的单：补登记，纳入成交匹配基线。
+
+        算法在 ``submit`` 阶段并没有拿到委托号（那时还没发单），所以这里由
+        派发回调补上；``fill_baseline`` 必须早于任何成交回报写入。
+        """
+        if vt_orderid in self.order_ids:
+            return
+        self.fill_baseline[vt_orderid] = self.traded_volume
+        self.order_ids.append(vt_orderid)
+        self.active_order_ids.add(vt_orderid)
+
     def on_trade(self, trade: TradeData) -> None:
         algo = self.algo
         if trade.vt_orderid not in self.active_order_ids and trade.vt_orderid not in self.order_ids:
             return
 
-        if trade.vt_symbol == self.vt_symbol or trade.vt_symbol == self.spread_symbol:
+        combo_report = trade.vt_symbol in (self.vt_symbol, self.spread_symbol)
+        if self.spread_mode_reports is not None and self.spread_mode_reports != combo_report:
+            algo.write_log(f"忽略与首笔成交口径不一致的回报 {trade.vt_tradeid}")
+            return
+        if combo_report:
             if self.spread_mode_reports is None:
                 self.spread_mode_reports = True
                 algo.write_log("成交回报按【组合代码】推送（组合口径统计生效）")
             self.traded_volume += trade.volume
             self.traded_amount += trade.volume * trade.price
             self.traded_price = self.traded_amount / self.traded_volume
-            algo.calculate_traded_volume()
-            algo.calculate_traded_price()
-            algo.put_event()
-            return
+        else:
+            if self.spread_mode_reports is None:
+                self.spread_mode_reports = False
+                algo.write_log(f"成交回报按【单腿代码】推送（{trade.vt_symbol}），改用按腿统计")
+            self._sync_from_legs()
 
-        # 腿口径：成交回报是单腿，交给模板按腿统计
-        if self.spread_mode_reports is None:
-            self.spread_mode_reports = False
-            algo.write_log(
-                f"成交回报按【单腿代码】推送（{trade.vt_symbol}），改用按腿统计 —— "
-                f"请核对价差持仓是否与预期一致"
-            )
-        self._sync_from_legs()
+        algo.calculate_traded_volume()
+        algo.calculate_traded_price()
+        goal = self.awaiting_fills.get(trade.vt_orderid)
+        if goal is not None and self.traded_volume + 1e-9 >= goal:
+            del self.awaiting_fills[trade.vt_orderid]
+        if self.cancelled_order and algo.is_active():
+            self._finish_if_dead()
+        # update_trade 不像 update_order 那样在钩子后复查 stopped。
+        if algo.stopped and algo.is_active():
+            algo.check_algo_cancelled()
+        if algo.status != Status.CANCELLED:  # check_algo_cancelled 已发布终态
+            algo.put_event()
 
     def _sync_from_legs(self) -> None:
         """把两腿成交量折算成已匹配的价差手数。
@@ -149,15 +183,22 @@ class ExchangeSpreadImpl:
             if len(prices) == 2 and all(prices):
                 self.traded_price = prices[0] - prices[1]
 
-        algo.calculate_traded_volume()
-        algo.calculate_traded_price()
-        algo.put_event()
-
     def on_order(self, order: OrderData) -> None:
         if order.vt_orderid not in self.order_ids:
             return
         if order.status in (Status.ALLTRADED, Status.CANCELLED, Status.REJECTED):
             self.active_order_ids.discard(order.vt_orderid)
+            # ALLTRADED 即使 traded 字段滞后也必须等足整单成交。
+            expected = max(order.volume, order.traded) if order.status == Status.ALLTRADED else order.traded
+            goal = self.fill_baseline.get(order.vt_orderid, 0.0) + expected
+            if self.traded_volume + 1e-9 < goal and goal > self.awaiting_fills.get(order.vt_orderid, 0):
+                self.awaiting_fills[order.vt_orderid] = goal
+                self.algo.write_log(
+                    f"等待成交明细 {order.vt_orderid}：委托{order.status.value}，"
+                    f"算法已匹配 {self.traded_volume:g}/{goal:g} 手；核对前不重发、不收尾"
+                )
+            if not self.active_order_ids:
+                self.cancel_started = None
         if order.status == Status.REJECTED:
             self.rejected_count += 1
             self.algo.write_log(
@@ -166,6 +207,7 @@ class ExchangeSpreadImpl:
                 f"（拒单原因见同一时刻 CTP 网关日志）"
             )
         if order.status in (Status.REJECTED, Status.CANCELLED):
+            self.cancelled_order = True
             self._finish_if_dead()
 
     def _finish_if_dead(self) -> None:
@@ -177,7 +219,7 @@ class ExchangeSpreadImpl:
         这里在确认没有在途委托后主动走 ``stop()``，让策略收到 CANCELLED 并重挂。
         """
         algo = self.algo
-        if self.active_order_ids or algo.paused or algo.stopped:
+        if not self.is_order_finished() or algo.paused or algo.stopped:
             return
         algo.stop()
 
@@ -190,6 +232,8 @@ class ExchangeSpreadImpl:
         if algo.paused or not algo.is_active():
             return
 
+        if self.awaiting_fills:
+            return
         if not self.active_order_ids:
             if algo.stopped:
                 return
@@ -198,11 +242,12 @@ class ExchangeSpreadImpl:
                     self.send_order()
             return
 
+        if self.cancel_started is not None:
+            if not self.cancel_warned and algo.elapsed - self.cancel_started >= 10:
+                self.cancel_warned = True
+                algo.write_log("撤单回报超时：保留在途组合单，不重发；请人工核对柜台委托及成交")
+            return
         if algo.stopped:
-            # 撤单回报可能丢失，超过 10s 强制收尾，避免算法卡死
-            if self.cancel_started and algo.elapsed - self.cancel_started >= 10:
-                algo.write_log("撤单回报超时 10s，强制收尾（请人工核对组合单）")
-                self.active_order_ids.clear()
             return
 
         if algo.purpose == AlgoKind.CLOSE and algo.market_close_timeout > 0:
@@ -247,15 +292,13 @@ class ExchangeSpreadImpl:
     # ------------------------------------------------------------ 收尾
     def cancel_all(self) -> None:
         algo = self.algo
-        if algo.paused:
+        if algo.paused or self.cancel_started is not None:
             return
         if self.active_order_ids:
             self.cancel_started = algo.elapsed
+            self.cancel_warned = False
         for vt_orderid in list(self.active_order_ids):
             algo.algo_engine.cancel_order(algo, vt_orderid)
 
-    def force_finish(self) -> None:
-        self.active_order_ids.clear()
-
     def is_order_finished(self) -> bool:
-        return not self.active_order_ids
+        return not self.active_order_ids and not self.awaiting_fills

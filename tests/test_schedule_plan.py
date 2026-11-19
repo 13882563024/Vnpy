@@ -174,10 +174,10 @@ class TestScheduleAgent(unittest.TestCase):
 
         fired = agent.check(monday)
         self.assertEqual([task.action for task in fired], [ACTION_START])
-        control.start_all.assert_called_once_with(force=True)
+        control.start_all.assert_not_called()
 
         self.assertEqual(agent.check(monday), [])      # 同一分钟不重复
-        self.assertEqual(control.start_all.call_count, 1)
+        control.start_all.assert_not_called()
 
     def test_start_skipped_when_disconnected(self) -> None:
         agent, control, _main = self._agent(make_plan())
@@ -211,10 +211,11 @@ class TestScheduleAgent(unittest.TestCase):
 
     def test_action_failure_does_not_raise(self) -> None:
         plan = SchedulePlan(tasks=[
-            ScheduleTask("08:58", TRADING_DAYS, ACTION_START, True),
+            ScheduleTask("08:58", TRADING_DAYS, ACTION_STOP, True),
         ])
         agent, control, main = self._agent(plan)
-        control.start_all.side_effect = RuntimeError("boom")
+        control.master_running = True
+        control.stop_all.side_effect = RuntimeError("boom")
 
         fired = agent.check(datetime(2026, 11, 9, 8, 58))
 
@@ -237,9 +238,22 @@ class TestScheduleAgent(unittest.TestCase):
         fired = agent.check(datetime(2026, 11, 9, 8, 49))
 
         self.assertEqual([task.action for task in fired], [ACTION_PURGE])
-        control.purge_stale_caches.assert_called_once()
+        control.purge_stale_caches.assert_not_called()
         messages = " ".join(str(call) for call in main.write_log.call_args_list)
-        self.assertIn("缓存清理完成", messages)
+        self.assertIn("跳过缓存清理", messages)
+
+    def test_scheduled_snapshot_cannot_confirm_or_correct(self):
+        agent, control, main = self._agent(make_plan())
+        td = control._gateway.return_value.td_api
+        td.orders_query_pending = False
+        td.orders_snapshot_ok = True
+        td.orders_snapshot = {'o1'}
+        td.position_snapshot_sides = {}
+        control._snapshot_problem.return_value = ''
+        agent._reconcile_apply()
+        control.confirm_reconciliation.assert_not_called()
+        control.sync_all.assert_not_called()
+        self.assertIn('未授予交易许可', str(main.write_log.call_args))
 
     def test_purge_skipped_while_trading(self) -> None:
         plan = SchedulePlan(tasks=[

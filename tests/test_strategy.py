@@ -387,6 +387,68 @@ class TestCustomFee(unittest.TestCase):
         self.assertEqual(strategy.fee_spec.close_today, 0.0)
 
 
+class TestWarmupExitGate(unittest.TestCase):
+    """预热期间是否挂止盈由 warmup_block_exit 控制（默认不拦）。"""
+
+    def _run(self, block: bool):
+        from unittest.mock import patch
+
+        from execution.base import PositionLayer
+
+        with patch("utils.layer_store.save"):
+            strategy, engine, spread = make_strategy({"warmup_block_exit": block})
+            strategy.direction = 1
+            strategy.layers = [PositionLayer(direction=1, volume=1, avg_spread=10.0,
+                                             layer_index=1, target_spread=12.0)]
+            strategy._maybe_preplace_exit()
+        return strategy, engine
+
+    def test_blocked_during_warmup(self):
+        strategy, engine = self._run(True)
+        self.assertEqual(engine.active_algos("take_profit"), [])
+        self.assertTrue(any("预热未完成" in log for log in engine.logs), engine.logs)
+
+    def test_default_keeps_protection(self):
+        strategy, engine = self._run(False)
+        self.assertTrue(engine.active_algos("take_profit"), "默认应照样挂止盈保护仓位")
+
+
+class TestTrimLegacyPosition(unittest.TestCase):
+    """柜台仓位比本地层账少：按手数从顶层削减，不产生盈亏。"""
+
+    def _strategy(self):
+        from unittest.mock import patch
+
+        from execution.base import PositionLayer
+
+        strategy, engine, spread = make_strategy({})
+        strategy.direction = 1
+        strategy.layers = [PositionLayer(direction=1, volume=1, avg_spread=30.0, layer_index=index)
+                           for index in (1, 2, 3)]
+        self.addCleanup(patch.stopall)
+        patcher = patch("utils.layer_store.save")
+        patcher.start()
+        return strategy, spread
+
+    def test_trims_top_layers_and_keeps_rest(self):
+        strategy, spread = self._strategy()
+        spread.net_pos = 1
+
+        removed = strategy.trim_legacy_position()
+
+        self.assertEqual(removed, 2)
+        self.assertEqual([layer.layer_index for layer in strategy.layers], [1])
+        self.assertEqual(sum(layer.realized_pnl for layer in strategy.closed_layers), 0.0)
+        self.assertTrue(all("柜台仓位减少" in layer.close_reason for layer in strategy.closed_layers))
+
+    def test_no_trim_when_direction_is_opposite(self):
+        strategy, spread = self._strategy()
+        spread.net_pos = -1
+
+        self.assertEqual(strategy.trim_legacy_position(), 0.0)
+        self.assertEqual(len(strategy.layers), 3)
+
+
 class TestOpenAndTakeProfit(unittest.TestCase):
     def test_signal_opens_then_take_profit_closes(self) -> None:
         strategy, engine, spread = make_strategy({"min_exit_pnl_override": 10})

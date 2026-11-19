@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from vnpy.trader.constant import Exchange
+from vnpy.trader.constant import Exchange, Status
 from vnpy_ctp.gateway.ctp_gateway import CtpTdApi, symbol_contract_map
 from vnpy_ctp.api import THOST_FTDC_PD_Long, THOST_FTDC_PD_Short
 
@@ -28,10 +28,102 @@ class PeriodicQueryTests(unittest.TestCase):
         self.assertEqual(gateway.td_api.position_snapshot_at, 123.0)
 
 
+class SpreadOrderReportTests(unittest.TestCase):
+    def setUp(self):
+        self.gateway = Mock(gateway_name="CTP")
+        self.api = SpreadCtpTdApi(self.gateway)
+        self.api.contract_inited = True
+        self.api.frontid, self.api.sessionid = 1, 2
+        self.order = dict(InstrumentID="SP a2701&a2703", FrontID=1, SessionID=2,
+                          OrderRef="3", OrderSysID="SYS", OrderStatus="3", OrderSubmitStatus="3",
+                          Direction="0", CombOffsetFlag="00", LimitPrice=-14, VolumeTotalOriginal=2,
+                          VolumeTraded=0, InsertDate="20261105", InsertTime="10:00:00",
+                          OrderPriceType="2", TimeCondition="3", VolumeCondition="1", StatusMsg="")
+        self.near = dict(InstrumentID="a2701", OrderSysID="SYS", TradeID="T1", Direction="0",
+                         OffsetFlag="0", TradeDate="20261105", TradeTime="10:00:01", Price=4200, Volume=1)
+        self.far = dict(self.near, InstrumentID="a2703", Direction="1", Price=4214)
+        contract = SimpleNamespace(exchange=Exchange.DCE)
+        contracts = patch.dict(symbol_contract_map, dict.fromkeys(
+            (self.order["InstrumentID"], "a2701", "a2703"), contract))
+        contracts.start()
+        self.addCleanup(contracts.stop)
+
+    def _query(self, row):
+        with patch.object(self.api, "reqQryOrder", return_value=0):
+            self.api.query_orders()
+        self.api.onRspQryOrder(row, {}, self.api._orders_query_reqid, True)
+
+    def test_two_legs_of_one_group_do_not_fill_two_group_order(self):
+        self.api.onRtnOrder(self.order)
+        for row in (self.near, self.near, self.far, self.far):
+            self.api.onRtnTrade(row)
+        self.assertEqual([call.args[0].symbol for call in self.gateway.on_trade.call_args_list],
+                         ["a2701", "a2703"])
+        self.gateway.on_order.assert_called_once()
+        order = self.gateway.on_order.call_args.args[0]
+        self.assertEqual((order.status, order.traded), (Status.NOTTRADED, 0))
+        partial = dict(self.order, OrderStatus="1", VolumeTraded=1)
+        self._query(partial)
+        self.api.onRtnOrder(self.order)   # 旧未成不能覆盖部成
+        self.api.onRtnOrder(partial)      # 查询与推送重复
+        self.assertEqual(self.gateway.on_order.call_count, 2)
+        order = self.gateway.on_order.call_args.args[0]
+        self.assertEqual((order.status, order.traded), (Status.PARTTRADED, 1))
+
+    def test_conflicting_duplicate_trade_latches_reconciliation(self):
+        self.api.onRtnOrder(self.order)
+        self.api.onRtnTrade(self.near)
+        self.api.onRtnTrade(dict(self.near, Volume=2))
+        self.gateway.on_trade.assert_called_once()
+        self.assertIn("明细冲突", self.api.reconciliation_event_error)
+
+    def test_cancel_then_late_query_and_leg_trade(self):
+        cancel = dict(self.order, OrderStatus="5", VolumeTraded=1)
+        self.api.onRtnOrder(cancel)
+        self._query(self.order)
+        self.api.onRtnOrder(cancel)
+        self.api.onRtnTrade(self.far)
+        self.api.onRtnTrade(self.far)
+        self.gateway.on_order.assert_called_once()
+        self.assertEqual(self.gateway.on_order.call_args.args[0].status, Status.CANCELLED)
+        self.gateway.on_trade.assert_called_once()
+        self.assertEqual(self.api.orders_snapshot, {"CTP.1_2_3"})
+
+    def test_trade_before_order_then_authoritative_query(self):
+        self.api.onRtnTrade(dict(self.near, FrontID=1, SessionID=2, OrderRef="3"))
+        self.gateway.on_order.assert_not_called()
+        self._query(dict(self.order, OrderStatus="0", VolumeTraded=2))
+        self.api.onRtnOrder(self.order)
+        self.api.onRtnTrade(self.near)
+        self.api.onRtnTrade(self.far)
+        self.gateway.on_order.assert_called_once()
+        self.assertEqual(self.gateway.on_order.call_args.args[0].status, Status.ALLTRADED)
+        self.assertEqual(self.gateway.on_trade.call_count, 2)
+
+    def test_query_only_final_for_spread_missing_from_contract_directory(self):
+        del symbol_contract_map[self.order["InstrumentID"]]
+        self._query(dict(self.order, ExchangeID="DCE", OrderStatus="0", VolumeTraded=2))
+        self.gateway.on_order.assert_called_once()
+        order = self.gateway.on_order.call_args.args[0]
+        self.assertEqual((order.exchange, order.status), (Exchange.DCE, Status.ALLTRADED))
+
+    def test_leg_cannot_inherit_parent_direction(self):
+        self.api.onRtnOrder(self.order)
+        self.api.onRtnTrade(dict(self.far, Direction=""))
+        self.gateway.on_trade.assert_not_called()
+        self.assertTrue(self.api.reconciliation_event_error)
+
+    def test_rejected_insert_not_revived_by_query(self):
+        self.api.onRspOrderInsert(self.order, {"ErrorID": 1}, 1, True)
+        self._query(self.order)
+        self.gateway.on_order.assert_called_once()
+        self.assertEqual(self.gateway.on_order.call_args.args[0].status, Status.REJECTED)
+
+
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
         gateway = SimpleNamespace(gateway_name="CTP", write_log=Mock(), write_error=Mock(),
-                                  on_position=Mock())
+                                  on_position=Mock(), on_account=Mock())
         self.api = SpreadCtpTdApi(gateway)
         self.api.brokerid = "broker"
         self.api.userid = "account"
@@ -48,6 +140,56 @@ class SnapshotTests(unittest.TestCase):
     def _respond(self, data, reqid, last=True, error=None):
         with patch.object(CtpTdApi, "onRspQryInvestorPosition", lambda *_: None):
             self.api.onRspQryInvestorPosition(data, error or {}, reqid, last)
+
+    def test_account_query_maps_margin_and_profit(self):
+        """总表要的占用保证金/已实现/未实现，父类没映射，必须在这里补。"""
+        self.api.onRspQryTradingAccount({
+            "AccountID": "account", "Balance": 300000.0, "Available": 240000.0,
+            "FrozenMargin": 1.0, "FrozenCash": 2.0, "FrozenCommission": 3.0,
+            "CurrMargin": 60000.0, "CloseProfit": 1200.0, "PositionProfit": -300.0,
+        }, {}, 1, True)
+
+        account = self.api.gateway.on_account.call_args.args[0]
+        self.assertEqual(account.curr_margin, 60000.0)
+        self.assertEqual(account.close_profit, 1200.0)
+        self.assertEqual(account.position_profit, -300.0)
+        self.assertEqual(account.frozen, 6.0)
+        self.assertEqual(account.available, 240000.0)
+
+    def test_contract_dir_late_reports_are_replayed_not_frozen(self):
+        """登录时先到的委托回报只缓存；目录就绪后重放，并且不再永久冻结核对。
+
+        实测：登录后 CTP 先推当日委托/成交，十几秒后才回合约目录。旧实现把
+        ``reconciliation_event_error`` 置成"合约目录尚未完成时收到委托回报"后
+        再也没有清过 —— 只要当天有单，之后每次核对都报"柜台回报待核实"。
+        """
+        self.api.contract_inited = False
+        self.api.onRtnOrder({"InstrumentID": "a2701"})
+        self.assertEqual(self.api.reconciliation_event_error, "合约目录尚未完成时收到委托回报")
+        self.assertEqual(len(self.api.order_data), 1)
+
+        self.api.contract_inited = True
+        with patch.object(self.api, "onRtnOrder") as replay:
+            self.api._replay_deferred_reports()
+
+        replay.assert_called_once()
+        self.assertEqual(self.api.reconciliation_event_error, "")
+        self.assertEqual(list(self.api.order_data), [])
+
+    def test_orders_snapshot_keeps_exchange_sysid(self):
+        """当日委托快照要同时给出 OrderSysID → 本地单号：它是跨重启的稳定键。"""
+        api = self.api
+        api.orders_query_pending = True
+        api._orders_query_reqid = 7
+        order = SimpleNamespace(vt_orderid="CTP.1_2_3")
+        with patch.object(api, "_order_from_query", return_value=order), \
+                patch.object(api, "_publish_order"):
+            api.onRspQryOrder({"InstrumentID": "a2701", "FrontID": 1, "SessionID": 2,
+                               "OrderRef": "3", "OrderSysID": " 12345 "}, {}, 7, True)
+
+        self.assertTrue(api.orders_snapshot_ok)
+        self.assertEqual(api.orders_snapshot_sysids, {"12345": "CTP.1_2_3"})
+        self.assertIn("CTP.1_2_3", api.orders_snapshot)
 
     def test_auto_query_updates_oms_without_publishing_snapshot(self):
         """后台刷新持仓要喂给 OMS，但不能改写人工核对快照。"""
@@ -66,6 +208,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.api.position_snapshot_at, 123.0)
         self.assertEqual(self.api.position_snapshot, {"keep": 1.0})
         self.api.gateway.on_position.assert_called()
+        # 后台查询也要发布"视图快照"，否则总表在每次回报后永远显示未知。
+        self.assertGreater(self.api.position_view_at, 0)
+        self.assertIn("a2701", self.api.position_view_sides)
 
     def test_empty_last_reply_is_a_complete_empty_snapshot(self):
         reqid = self._begin()
@@ -203,8 +348,7 @@ class SnapshotTests(unittest.TestCase):
         from vnpy.trader.constant import Direction, Offset, Status
         from vnpy.trader.object import OrderData
 
-        orderid = "CTP.1_2_3"
-        self.api._known_fields[orderid] = (Direction.LONG, Offset.CLOSE)
+        orderid = "1_2_3"
         order = OrderData(gateway_name="CTP", symbol="a2701", exchange=Exchange.DCE,
                           orderid="1_2_3", direction=Direction.LONG, offset=Offset.CLOSE,
                           price=-14, volume=1, traded=0, status=Status.NOTTRADED)
@@ -219,8 +363,11 @@ class SnapshotTests(unittest.TestCase):
                                  "TradeID": "T1", "TradeDate": "20261105",
                                  "TradeTime": "10:00:00", "Price": -14, "Volume": 1})
         self.api.gateway.on_trade.assert_called_once()
-        self.api.gateway.on_order.assert_called_once()  # 补发全部成交，界面不再显示“未成交”
-        self.assertEqual(order.status, Status.ALLTRADED)
+        trade = self.api.gateway.on_trade.call_args.args[0]
+        self.assertEqual((trade.vt_orderid, trade.direction, trade.offset),
+                         (order.vt_orderid, Direction.LONG, Offset.CLOSE))
+        self.api.gateway.on_order.assert_not_called()
+        self.assertEqual((order.status, order.traded), (Status.NOTTRADED, 0))
 
     def test_order_query_publishes_authoritative_final_status(self):
         from vnpy.trader.constant import Status

@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "tasks": [
     {
       "time": "08:49",
@@ -26,19 +26,6 @@
       "action": "connect",
       "enabled": true,
       "note": "连接 CTP"
-    },
-    {
-      "time": "08:55",
-      "days": [
-        1,
-        2,
-        3,
-        4,
-        5
-      ],
-      "action": "reconcile",
-      "enabled": true,
-      "note": "核对并纠正本地账"
     },
     {
       "time": "08:58",
@@ -76,19 +63,6 @@
         5
       ],
       "action": "connect",
-      "enabled": true,
-      "note": ""
-    },
-    {
-      "time": "20:55",
-      "days": [
-        1,
-        2,
-        3,
-        4,
-        5
-      ],
-      "action": "reconcile",
       "enabled": true,
       "note": ""
     },

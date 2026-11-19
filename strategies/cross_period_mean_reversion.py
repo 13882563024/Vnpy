@@ -1,4 +1,4 @@
-﻿"""跨期均值回归策略（vnpy_spreadtrading 载体）。
+"""跨期均值回归策略（vnpy_spreadtrading 载体）。
 
 策略规则见 ``docs/plan/PLAN-spreadtrading-跨期均值回归策略实现.md``：
 
@@ -144,6 +144,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
     # 最小预热门槛：样本数与实际覆盖时长都达标才允许开仓/加仓
     warmup_min_samples: int = 30
     warmup_min_minutes: float = 5.0
+    # 预热未完成时是否也禁止预挂止盈单（默认关：止盈是仓位保护，不宜因统计未就绪而裸奔）
+    warmup_block_exit: bool = False
     status_log_seconds: float = 60.0
     signal_log_seconds: float = 30.0
 
@@ -160,7 +162,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         "entry_partial_timeout", "payup",
         "max_exit_per_tick", "close_only",
         "live_trading", "trading_sessions", "warmup_days",
-        "warmup_min_samples", "warmup_min_minutes",
+        "warmup_min_samples", "warmup_min_minutes", "warmup_block_exit",
         "status_log_seconds", "signal_log_seconds",
     ]
 
@@ -202,12 +204,16 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._snapshot: SpreadSnapshot | None = None
         self._last_push_key: str = ""
         self._last_pos_check: float = 0.0
+        self._layers_loaded: bool = False
+        # 最近若干条策略日志（界面"最新策略日志"列用）；只在内存，不落盘。
+        self._log_ring: deque[tuple[str, str]] = deque(maxlen=40)
 
         self.trading_day: str = ""
         self.mean: float = 0.0
         self.sd: float = 0.0
         self.spread_value: float = 0.0
         self.daily_realized: float = 0.0
+        self.total_realized: float = 0.0
         self.last_blocked: str = ""
 
         self.direction_text: str = "空仓"
@@ -220,6 +226,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._in_advance: bool = False
         self._last_status_log: float = 0.0
         self._last_warmup_log: float = 0.0
+        self._last_warmup_exit_log: float = 0.0
         self._last_close_guard_log: float = 0.0
         self.last_margin_ratio: float | None = None
         # 只暂停策略动作，不触碰柜台在途委托；重启后仍须重新核对。
@@ -604,6 +611,84 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             f"止损口径：整仓 {stop_loss:g} 元 ÷ {max(1, int(self.max_positions))} 层 "
             f"= 每层 {self.stop_loss_per_tier:g} 元"
         )
+        if int(self.max_hold_days) <= 0:
+            self.write_log("时间止损：已关闭（max_hold_days=0）")
+        if int(self.roll_exit_days) <= 0:
+            self.write_log("换月强平：已关闭（roll_exit_days=0），进入交割月前须自行平仓")
+        if int(self.roll_entry_cutoff_days) <= 0:
+            self.write_log("换月停止开仓：已关闭（roll_entry_cutoff_days=0）")
+        self._load_layers()
+
+    # ------------------------------------------------------------ 层账落盘
+    def _layer_payload(self, layer) -> dict:
+        from dataclasses import fields as dataclass_fields
+
+        data = {}
+        for item in dataclass_fields(type(layer)):
+            value = getattr(layer, item.name, None)
+            if item.name in ("open_datetime", "close_datetime"):
+                data[item.name] = value.isoformat() if hasattr(value, "isoformat") else ""
+            else:
+                data[item.name] = value
+        return data
+
+    def _save_layers(self) -> None:
+        """每次层账变化都落盘：重启后按原样恢复，成本价不再被柜台均价覆盖。"""
+        try:
+            from utils.layer_store import save
+
+            save(self.spread_name, [self._layer_payload(layer) for layer in self.layers])
+        except Exception:
+            pass
+
+    def _load_layers(self) -> None:
+        """启动时恢复本地层账；没有记录才回落到"从柜台接管"。"""
+        if getattr(self, "_layers_loaded", False):
+            return
+        self._layers_loaded = True
+        if self.layers:
+            return
+        # 本地两腿账上没有仓位时不恢复层：否则会把上一个交易日/别的账户的层账
+        # 捡回来，与柜台对不上。恢复的前提必须是"本地账本来就有这个仓"。
+        net = float(getattr(self.spread, "net_pos", 0) or 0)
+        if abs(net) < 1e-9:
+            return
+        try:
+            from utils.layer_store import load
+
+            rows = load(self.spread_name)
+        except Exception:
+            return
+        if not rows:
+            return
+        from dataclasses import fields as dataclass_fields
+        from datetime import datetime as _moment
+
+        names = {item.name for item in dataclass_fields(PositionLayer)}
+        layers = []
+        for row in rows:
+            kwargs = {}
+            for name in names & set(row):
+                value = row[name]
+                if name in ("open_datetime", "close_datetime"):
+                    try:
+                        value = _moment.fromisoformat(value) if value else None
+                    except (TypeError, ValueError):
+                        value = None
+                kwargs[name] = value
+            try:
+                layer = PositionLayer(**kwargs)
+            except Exception:
+                continue
+            if layer.is_open:
+                layers.append(layer)
+        if not layers:
+            return
+        self.layers = layers
+        self.direction = 1 if layers[0].direction > 0 else -1
+        self.write_log(
+            f"层账已恢复：{len(layers)} 层（成本价取自本地记录，不按柜台均价重建）"
+        )
 
     # ------------------------------------------------------------ 旧持仓接管
     def _legacy_positions(self) -> list:
@@ -736,6 +821,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             self.layers.append(layer)
             added.append(layer)
             remaining -= size
+        self._save_layers()
         return added
 
     def local_layer_net(self) -> float:
@@ -818,6 +904,55 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         # 每层都挂一张止盈（_maybe_preplace_exit 内部逐层判断，通常 1 手/张）
         self._maybe_preplace_exit(added[-1].open_datetime)
         return volume
+
+    def trim_legacy_position(self) -> float:
+        """柜台仓位比本地层账少：从顶层往下削减，返回削减的手数。
+
+        只按**手数**对齐，不制造盈亏：被削减的层按自己的均价归档
+        （``realized_pnl=0``），``close_reason`` 写明"柜台仓位减少"。
+        方向相反或差额解释不了时一律不动，交人工核对。
+        """
+        target = float(getattr(self.spread, "net_pos", 0) or 0)
+        local = sum((layer.direction or 0) * layer.volume for layer in self.layers)
+        excess = abs(local) - abs(target)
+        if excess <= 1e-9:
+            return 0.0
+        if target != 0 and (local > 0) != (target > 0):
+            return 0.0                     # 方向反了，削层解释不了
+        moment = self._snapshot.datetime if self._snapshot else datetime.now()
+        removed = 0.0
+        for layer in sorted(list(self.layers), key=lambda item: item.layer_index, reverse=True):
+            if removed >= excess - 1e-9:
+                break
+            take = min(layer.volume, excess - removed)
+            if take <= 1e-9:
+                continue
+            if layer.algoid:
+                self.write_log(
+                    f"第{layer.layer_index}层被削减，原止盈算法 {layer.algoid} 未自动撤销，"
+                    f"请确认该委托是否还在柜台"
+                )
+            if take >= layer.volume - 1e-9:
+                layer.mark_closed(layer.avg_spread, moment, "柜台仓位减少，按柜台同步删除")
+                # 按对象身份删，不能用 list.remove（dataclass 相等会把同参数的层删错）
+                index = next((i for i, item in enumerate(self.layers) if item is layer), None)
+                if index is not None:
+                    self.layers.pop(index)
+                self.closed_layers.append(layer)
+            else:
+                layer.volume -= take
+            removed += take
+        if removed <= 1e-9:
+            return 0.0
+        if not self.layers:
+            self.direction = 0
+        self._refresh_variables()
+        self._save_layers()
+        self.write_log(
+            f"柜台仓位比本地层账少 {removed:g} 手：已从顶层削减（按手数对齐，不产生盈亏）；"
+            f"剩余 {len(self.layers)} 层"
+        )
+        return removed
 
     def _resolve_executor(self) -> str:
         """显式策略参数优先，其余取注册表；组合不可用时拒绝隐式降级。"""
@@ -915,6 +1050,13 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         previous = self.trading_day
         self.trading_day = day
         self.daily_realized = 0.0
+        try:
+            from utils.pnl_ledger import load
+            # 只恢复跨日累计；当日收益是"本进程当天"的口径，重启后重新累计，
+            # 避免把台账里同一天的历史值当成这次运行的结果。
+            self.total_realized, _today = load(self.spread_name, day)
+        except Exception:
+            pass
 
         if previous:
             # CTP 委托当日有效：新交易日直接归档旧单（不查柜台、不发撤单）。
@@ -1472,6 +1614,13 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         所以每层都有自己的止盈，只是不同时刻只挂一张。
         """
         self._decision_moment = moment      # 供 exit_layer 内部的时段校验对齐
+        # 预热期间是否挂止盈由 warmup_block_exit 决定（默认不拦：止盈是仓位保护）。
+        if getattr(self, "warmup_block_exit", False) and not self._warmup_ready():
+            now = (moment or datetime.now()).timestamp()
+            if now - self._last_warmup_exit_log >= 30:
+                self._last_warmup_exit_log = now
+                self.write_log("预热未完成：暂不预挂止盈单，仓位在此期间没有止盈保护")
+            return
         # 始终盯**最高层**（layer_index 最大），不依赖列表尾部的排列顺序。
         layer = max(self.layers, key=lambda item: item.layer_index) if self.layers else None
         if layer is None:
@@ -1632,6 +1781,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self.layers.append(layer)
         self.direction = job.direction
         self._refresh_variables()
+        self._save_layers()
 
         self.write_log(
             f"开仓成交 {layer.describe()} 价差{price:g} 成交{volume:g}手"
@@ -1721,6 +1871,13 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         original_volume = layer.volume
         layer.volume -= volume
         self.daily_realized += net
+        self.total_realized += net
+        try:
+            # 台账只负责持久化累计；内存里的值才是本次运行的口径，不回读覆盖。
+            from utils.pnl_ledger import record
+            record(self.spread_name, net, self.trading_day)
+        except Exception:
+            pass
 
         if layer.volume <= 1e-9:
             layer.volume = original_volume      # 还原成交手数，便于归档展示
@@ -1729,6 +1886,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             self.closed_layers.append(layer)
             if not self.layers:
                 self.direction = 0
+        self._save_layers()
         return net
 
     def _layer_fee_for_volume(self, layer: PositionLayer, volume: float) -> float:
@@ -1801,7 +1959,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
     def exit_layer(self, spread, layer: PositionLayer) -> str:
         if not self._can_send():
             return ""
-        extra = self._build_extra(AlgoKind.TAKE_PROFIT, f"预挂止盈 第{layer.layer_index}层")
+        extra = self._build_extra(AlgoKind.TAKE_PROFIT, f"预挂止盈 第{layer.layer_index}层",
+                                  tier_id=layer.tier_id)
         if layer.direction > 0:
             return self.start_short_algo(layer.target_spread, layer.volume,
                                          int(self.payup), 0, False, extra)
@@ -1816,7 +1975,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         if volume <= 0 or self._snapshot is None:
             return ""
         price = exit_spread_price(self._snapshot, self.direction)
-        extra = self._build_extra(AlgoKind.CLOSE, reason)
+        extra = self._build_extra(AlgoKind.CLOSE, reason,
+                                  tier_id=(tier_ids[0] if len(tier_ids) == 1 else ""))
         if self.direction > 0:
             return self.start_short_algo(price, volume, int(self.payup), 0, False, extra)
         return self.start_long_algo(price, volume, int(self.payup), 0, False, extra)
@@ -1825,10 +1985,11 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         if not self.paused:
             self.stop_algo(algoid)
 
-    def _build_extra(self, purpose: str, reason: str = "") -> dict:
+    def _build_extra(self, purpose: str, reason: str = "", tier_id: str = "") -> dict:
         exchange_symbol = ""
         if self.executor_mode == EXECUTOR_EXCHANGE_SPREAD:
             exchange_symbol = self.cfg.exchange_spread_vt_symbol
+        near_vt, far_vt = (self.cfg.legs + ["", ""])[:2]
         return {
             "mode": self.executor_mode,
             "purpose": purpose,
@@ -1838,7 +1999,42 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             "offset_flag_width": int(self.spread_offset_flag_width),
             "market_close_timeout": float(self.market_close_timeout),
             "entry_partial_timeout": float(self.entry_partial_timeout),
+            # 逐笔核验上下文（OrderGate 用它构造 OrderIntent + ScopedLimits）
+            "tier_id": tier_id,
+            "near": str(near_vt).split(".")[0],
+            "far": str(far_vt).split(".")[0],
+            "near_vt": str(near_vt),
+            "far_vt": str(far_vt),
+            "exchange": str(self.cfg.exchange),
+            "max_open_lots": int(self.max_positions),
+            "margin_per_lot": float(self.cfg.margin_per_lot),
+            "trading_sessions": str(self.trading_sessions),
+            "config_version": (
+                f"{self.spread_name}:{int(self.max_positions)}:"
+                f"{float(self.layer_volume):g}:{float(self.cfg.margin_per_lot):g}"
+            ),
         }
+
+    def write_log(self, msg: str) -> None:
+        """记一条日志，同时留一份在内存里给总表显示。"""
+        ring = getattr(self, '_log_ring', None)
+        if ring is not None:
+            try:
+                ring.append((datetime.now().strftime('%H:%M:%S'), str(msg)))
+            except Exception:
+                pass
+        super().write_log(msg)
+
+    def latest_log(self) -> str:
+        """最近一条有信息量的日志；全是"状态"行时退回最新一条。"""
+        ring = list(getattr(self, '_log_ring', ()) or ())
+        for moment, text in reversed(ring):
+            if not str(text).startswith('状态'):
+                return f'{moment} {text}'
+        if ring:
+            moment, text = ring[-1]
+            return f'{moment} {text}'
+        return ''
 
     # ================================================================ 展示
     def _refresh_variables(self) -> None:

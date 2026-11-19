@@ -107,20 +107,7 @@ class ScheduleAgent(QtCore.QObject):
         if self.control.master_running:
             self._log("定时任务：交易运行中，跳过缓存清理（避免清掉在途委托）")
             return
-        try:
-            result = self.control.purge_stale_caches(now=now)
-        except Exception as exc:      # noqa: BLE001 - 清理失败不应阻断开盘流程
-            self._log(f"定时任务：缓存清理失败 {exc}")
-            return
-        dropped = result.get("engine_orders", 0) + result.get("engine_trades", 0) \
-            + result.get("reserved", 0) + result.get("algos", 0)
-        if dropped:
-            self._log(
-                f"定时任务：缓存清理完成 —— 隔夜委托 {result.get('engine_orders', 0)} 笔、"
-                f"成交 {result.get('engine_trades', 0)} 笔、策略占位 "
-                f"{result.get('reserved', 0)} 条、旧算法 {result.get('algos', 0)} 个已清掉")
-        else:
-            self._log("定时任务：缓存清理完成，没有隔夜残留（缓存已是当日状态）")
+        self._log("定时任务：跳过缓存清理；不能依据本地时钟释放未决委托占位")
 
     def _connect_setting(self) -> dict | None:
         """读 vnpy 保存的 CTP 连接配置；两个历史文件名都试。"""
@@ -177,33 +164,32 @@ class ScheduleAgent(QtCore.QObject):
         """
         try:
             gateway = self.control._gateway()
-            if gateway is not None and hasattr(gateway, "query_orders"):
-                gateway.query_orders()
+            if gateway is None or not callable(getattr(getattr(gateway, "td_api", None), "query_orders", None)):
+                self._log("定时任务：柜台不支持当日委托查询，跳过核对")
+                return
+            gateway.td_api.query_orders()
         except Exception as exc:      # noqa: BLE001 - 查询失败不清本地记录
             self._log(f"定时任务：查询当日委托失败 {exc}；本地委托状态未知，不做清理")
+            return
         QtCore.QTimer.singleShot(POSITION_WAIT_MS, self._reconcile_apply)
 
     def _reconcile_apply(self) -> None:
         try:
-            self.control.confirm_reconciliation()
+            td = getattr(self.control._gateway(), "td_api", None)
+            if not getattr(td, "orders_snapshot_ok", False) or getattr(td, "orders_query_pending", True):
+                self._log("定时任务：本轮委托快照未完整返回，不确认、不纠正")
+                return
+            problem = self.control._snapshot_problem(td)
+            if problem:
+                self._log(f"定时任务：柜台持仓快照不可用：{problem}")
+                return
+            order_count = len(td.orders_snapshot)
+            position_count = len(td.position_snapshot_sides)
         except Exception as exc:      # noqa: BLE001 - 快照不完整时拒绝确认是对的
             self._log(f"定时任务：核对未通过（{exc}）；不会自动开始交易")
             return
-        if self.control.master_running:
-            self._log("定时任务：核对完成；当前已在交易中，跳过纠正")
-            return
-        try:
-            results = self.control.sync_all(force=True)
-        except Exception as exc:      # noqa: BLE001
-            self._log(f"定时任务：批量纠正失败 {exc}")
-            return
-        ok = [name for name, kind, _ in results if kind == "ok"]
-        skip = [name for name, kind, _ in results if kind == "skip"]
-        fails = [(name, message) for name, kind, message in results if kind == "fail"]
-        self._log(f"定时任务：核对并纠正完成，成功 {len(ok)}、无需处理 {len(skip)}、"
-                  f"失败 {len(fails)}")
-        for name, message in fails:
-            self._log(f"定时任务：{name} 纠正失败 —— {message}")
+        self._log(f"定时任务：本轮柜台快照含当日委托 {order_count} 笔、持仓合约 {position_count} 个；"
+                  "未授予交易许可，未执行批量纠正")
 
     def _start(self, now: datetime) -> None:
         if self.control.master_running:
@@ -212,12 +198,7 @@ class ScheduleAgent(QtCore.QObject):
         if not self.control.md_ready() or not self.control.td_ready():
             self._log("定时任务：交易或行情未连接，跳过开始交易")
             return
-        try:
-            started = self.control.start_all(force=True)
-        except Exception as exc:      # noqa: BLE001 - 失败原因要留在日志里
-            self._log(f"定时任务：开始交易失败 {exc}")
-            return
-        self._log(f"定时任务：已开始交易（{len(started)} 个合约）")
+        self._log("定时任务：逐笔报单门禁尚未接入，不启动无人值守实盘；需要人工核对")
 
     def _stop(self, now: datetime) -> None:
         if not self.control.master_running:

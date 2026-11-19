@@ -12,6 +12,9 @@ from utils.spread_config import SpreadConfig
 # 交易关闭期间柜台仓位只可能被人工改动；给足阅读/确认时间，真正的时效由
 # “快照之后是否又收到委托/成交回报”保证，而不是一个很短的秒数。
 SNAPSHOT_MAX_AGE = 300.0
+# 预启动（盘前挂好、开盘自动放行）的最长等待时间。
+# 与快照有效期取同一个值：超过 5 分钟，核对依据本身已经过期，必须重新核对。
+ARM_MAX_WAIT = 300.0
 
 
 class SpreadTradingControl:
@@ -47,6 +50,9 @@ class SpreadTradingControl:
         self._reconciliation_snapshot_account: tuple[str, str] | None = None
         self._reconciliation_snapshot_at: float | None = None
         self._registry_names: frozenset[str] = frozenset()
+        # 预启动：已就绪但还在等开盘行情的合约（name -> 该项的放行截止时间）。
+        # 这些策略已 resume、trading=True，但 live_trading=False，不会有任何报单。
+        self.armed: dict[str, float] = {}
         self._startup_query_done = False
         self._orders_restored = False
         self._recovered_orderids: set[str] = set()
@@ -82,33 +88,8 @@ class SpreadTradingControl:
         return trading_day_of(now or datetime.now()).isoformat()
 
     def is_reconciled(self, name: str) -> bool:
-        if name in self.reconciled_contracts:
-            return True
-        # 重启后内存清空，但几分钟内刚核对过的账号状态仍可沿用，避免一切都要重来。
-        return self._saved_snapshot_ok(name)
-
-    def _saved_entry(self, name: str) -> dict | None:
-        entry = self._saved_reconciliation.get(name)
-        return entry if isinstance(entry, dict) else None
-
-    def _saved_snapshot_ok(self, name: str) -> bool:
-        entry = self._saved_entry(name)
-        if not entry:
-            return False
-        try:
-            saved_at = float(entry.get("at", 0))
-            account = tuple(entry.get("account") or ())
-        except (TypeError, ValueError):
-            return False
-        if account and account != self._account_key():
-            return False
-        return time() - saved_at <= SNAPSHOT_MAX_AGE
-
-    def _saved_sides(self, name: str) -> dict | None:
-        if not self._saved_snapshot_ok(name):
-            return None
-        sides = self._saved_entry(name).get("sides")
-        return sides if isinstance(sides, dict) else None
+        # 历史确认只用于审计，不授权新会话，也不覆盖新成交造成的失效。
+        return name in self.reconciled_contracts and not self._snapshot_problem()
 
     def _persist(self) -> None:
         """把核对快照与遗留委托写盘；失败只在日志提示，不影响当前操作。"""
@@ -346,6 +327,10 @@ class SpreadTradingControl:
                     vt_orderid = f"CTP.{vt_orderid}"
                 if vt_orderid in self._recovered_orderids:
                     continue
+                # 终态先于窗口初始化到达时，磁盘上的旧活单绝不能复活它。
+                current = getattr(oms, 'orders', {}).get(vt_orderid)
+                if getattr(current, 'status', None) in (Status.ALLTRADED, Status.CANCELLED, Status.REJECTED):
+                    continue
                 vt_symbol = str(row.get("vt_symbol") or "")
                 try:
                     symbol, exchange_text = vt_symbol.split(".", 1)
@@ -370,10 +355,17 @@ class SpreadTradingControl:
                     status=status,
                     datetime=moment,
                 )
-                try:
-                    oms.process_order_event(Event(EVENT_ORDER, order))
-                except Exception:
-                    continue
+                if isinstance(current, OrderData):
+                    if current.vt_symbol != order.vt_symbol:
+                        self.errors[name] = '柜台与本地委托标识冲突，禁止自动恢复'
+                        continue
+                    order, status = current, current.status
+                    moment_known = order.datetime is not None and order.datetime.tzinfo is not None
+                else:
+                    try:
+                        oms.process_order_event(Event(EVENT_ORDER, order))
+                    except Exception:
+                        continue
                 if not moment_known:
                     self._moment_unknown.add(order.vt_orderid)
                 if isinstance(mapping, dict) and order.vt_symbol in set(
@@ -595,6 +587,23 @@ class SpreadTradingControl:
         if strategy is not None and hasattr(strategy, "algoids"):
             strategy.algoids.discard(algoid)
 
+    def _cabinet_sysid_index(self, td) -> dict[str, str]:
+        """本地委托号 → OrderSysID。网关的实时映射与流水恢复映射都倒过来查。
+
+        ``sysid_orderid_map`` / ``_journal_sysids`` 的键可能是裸 sysid，也可能是
+        ``(broker, user, day, exchange, sysid)``；值的本地委托号不带 ``CTP.`` 前缀。
+        """
+        index: dict[str, str] = {}
+        for attr in ("sysid_orderid_map", "_journal_sysids"):
+            mapping = getattr(td, attr, None)
+            if not isinstance(mapping, dict):
+                continue
+            for key, value in mapping.items():
+                sysid = key[-1] if isinstance(key, tuple) else key
+                if isinstance(sysid, str) and isinstance(value, str) and sysid and value:
+                    index.setdefault(value, sysid)
+        return index
+
     def _prune_orders_absent_from_cabinet(self, name: str, config) -> int:
         """以柜台**当日委托快照**为准，清掉本地记录里“柜台已经没有”的委托。
 
@@ -616,6 +625,21 @@ class SpreadTradingControl:
             self._log_orders_snapshot_missing(name)
             return 0
         snapshot = set(getattr(td, "orders_snapshot", set()) or ())
+        cabinet_sysids = set((getattr(td, "orders_snapshot_sysids", {}) or {}).keys())
+        sysid_of = self._cabinet_sysid_index(td)
+
+        def still_at_cabinet(orderid: str) -> bool:
+            """柜台当日委托里是否还有这一笔。
+
+            优先用交易所委托号（跨重启/重连不变）；本地还没有 sysid 的（刚报出、
+            尚未被受理）退回会话号。两者都查不到才算"柜台没有"。
+            """
+            bare = orderid.split(".", 1)[1] if "." in orderid else orderid
+            if orderid in snapshot or bare in snapshot:
+                return True
+            sysid = sysid_of.get(bare) or sysid_of.get(orderid)
+            return bool(sysid and sysid in cabinet_sysids)
+
         symbols = set(config.legs + [config.exchange_spread_vt_symbol])
         oms = None
         try:
@@ -629,7 +653,7 @@ class SpreadTradingControl:
                   for row in (self._saved_orders.get(name) or [])}
         dropped: list[str] = []
         for orderid in sorted(local):
-            if not orderid or orderid in snapshot:
+            if not orderid or still_at_cabinet(orderid):
                 continue
             order = getattr(oms, "orders", {}).get(orderid) if oms is not None else None
             vt_symbol = getattr(order, "vt_symbol", "")
@@ -914,7 +938,7 @@ class SpreadTradingControl:
         """作废当前核对。
 
         ``forget=True``（默认）连本地保存的快照一起丢弃，用于断线/换账号/配置变化；
-        只停止交易时用 ``forget=False``，下次打开程序仍能沿用几分钟内的核对结果。
+        只停止交易时用 ``forget=False`` 保留审计记录；重启必须重新核对。
         """
         self.reconciled_contracts.clear()
         self._reconciliation_snapshot_generation = None
@@ -1129,18 +1153,43 @@ class SpreadTradingControl:
             self.errors[config.name] = f"注册未完成：{exc}；禁止交易，连接后重试"
         return config, created
 
-    def _validate_quote(self, config: SpreadConfig):
+    def quote_problem(self, config: SpreadConfig) -> str:
+        """两腿是否已有可交易报价；返回空串表示可用，否则是可读原因。
+
+        盘前／集合竞价期间盘口是空的，这个检查必然失败——预启动（arm）就是
+        为这种情况准备的：策略先挂好，等这里返回空串的那一刻再开实盘。
+        """
         from utils.filters import as_local
         if not self.md_ready() or not self.td_ready():
-            raise ManagedSpreadError("行情或交易前置尚未登录")
+            return "行情或交易前置尚未登录"
         for symbol in config.legs:
             tick = self.main_engine.get_tick(symbol)
             if tick is None or not tick.bid_price_1 or not tick.ask_price_1:
-                raise ManagedSpreadError(f"{symbol} 无有效买一/卖一报价")
+                return f"{symbol} 无有效买一/卖一报价"
             timestamp = as_local(tick.datetime)
             now = as_local(datetime.now())
             if not timestamp or abs((now - timestamp).total_seconds()) > 5:
-                raise ManagedSpreadError(f"{symbol} 报价超过 5 秒，禁止交易")
+                return f"{symbol} 报价超过 5 秒，禁止交易"
+        return ""
+
+    def _validate_quote(self, config: SpreadConfig):
+        problem = self.quote_problem(config)
+        if problem:
+            raise ManagedSpreadError(problem)
+
+
+    @staticmethod
+    def _orders_snapshot_problem(td) -> str:
+        error = getattr(td, 'reconciliation_event_error', '')
+        if error:
+            return f'柜台回报待核实：{error}'
+        if not hasattr(td, 'orders_snapshot_ok'):
+            return ''  # 旧的非 CTP 测试/只读适配器没有此字段。
+        stamp = float(getattr(td, 'orders_snapshot_at', 0) or 0)
+        if (getattr(td, 'orders_query_pending', False) or not td.orders_snapshot_ok
+                or not stamp or not 0 <= monotonic() - stamp <= SNAPSHOT_MAX_AGE):
+            return '当日委托快照不可用或未完整返回；请重新核对柜台委托'
+        return ''
 
     def _snapshot_problem(self, td=None) -> str:
         """返回“柜台持仓快照不可用”的具体原因；空字符串表示可用。
@@ -1176,13 +1225,11 @@ class SpreadTradingControl:
         return ""
 
     def _cabinet_leg_differences(self, config: SpreadConfig, spread) -> list[dict] | None:
-        """用本次柜台快照做双向比较；重启后 5 分钟内可用上次保存的快照。"""
+        """只比较本次有效柜台快照；无证据返回未知，而不是沿用旧空仓。"""
         td = getattr(self._gateway(), "td_api", None)
         if self._snapshot_problem(td):
-            sides = self._saved_sides(config.name)
-            if sides is None:
-                return None
-        elif hasattr(td, "position_snapshot_sides"):
+            return None
+        if hasattr(td, "position_snapshot_sides"):
             sides = td.position_snapshot_sides
         else:
             return None  # 非本项目网关：没有柜台快照能力
@@ -1474,6 +1521,10 @@ class SpreadTradingControl:
         if problem:
             self.invalidate_reconciliation()
             raise ManagedSpreadError(f"柜台持仓快照不可用：{problem}；请点“核对柜台状态”重新查询")
+        problem = self._orders_snapshot_problem(td)
+        if problem:
+            self.invalidate_reconciliation()
+            raise ManagedSpreadError(problem)
         self._reconciliation_snapshot_generation = getattr(td, "position_query_generation", None)
         self._reconciliation_snapshot_account = getattr(td, "position_snapshot_account", None)
         self._reconciliation_snapshot_at = float(getattr(td, "position_snapshot_at", 0) or 0)
@@ -1487,7 +1538,7 @@ class SpreadTradingControl:
             if item["leg_differences"] is not None or not hasattr(td, "position_snapshot_at"):
                 self.reconciled_contracts[item["name"]] = moment
         self._registry_names = frozenset(self.service.list())
-        # 把“已核对”与所用快照写盘：重启后 5 分钟内仍生效，不必重新确认一遍。
+        # 持久化已查看的快照用于审计，不作为跨会话的发单许可。
         sides = dict(getattr(td, "position_snapshot_sides", {}) or {})
         account = list(self._account_key() or ())
         saved_at = time()
@@ -1517,6 +1568,25 @@ class SpreadTradingControl:
                 )
             except Exception:
                 pass  # 日志故障不撤销已经完成的人工核对。
+
+    @staticmethod
+    def _position_change_label(old: dict[str, float], target: dict[str, float], legs) -> str:
+        """把本次持仓纠正归类：一致 / 补充 / 同步（减仓或反方向）。"""
+        changed = False
+        supplement = True
+        for symbol in legs:
+            before = float(old.get(symbol, 0) or 0)
+            after = float(target.get(symbol, 0) or 0)
+            if abs(before - after) < 1e-9:
+                continue
+            changed = True
+            if before and after and (before > 0) != (after > 0):
+                supplement = False
+            elif abs(before) > abs(after):
+                supplement = False
+        if not changed:
+            return "一致"
+        return "补充" if supplement else "同步"
 
     def sync_spread_position(self, name: str, *, force: bool = False) -> str:
         """按柜台持仓同步本地价差账：空仓则清零，两腿匹配则接管为策略层。
@@ -1580,6 +1650,7 @@ class SpreadTradingControl:
         # 权威依据：柜台当日委托快照。柜台没有的 = 上一交易日（已随结算失效）或已终结，
         # 一律清掉本地记录；快照不可用时这一步什么都不做（交给下面的兜底规则）。
         pruned = self._prune_orders_absent_from_cabinet(name, config)
+        trimmed_total = 0.0
         # 用户点“核对并纠正”即视为已人工核对：顺手清掉本次登录后从未有回报的旧委托记忆。
         pruned += self._prune_stale_order_records(name, config)
         blockers: list[str] = []
@@ -1665,11 +1736,15 @@ class SpreadTradingControl:
             spread.calculate_pos()
             if not flat:
                 if strategy.layers and not self._layers_match_net(spread, strategy):
-                    # 层账与柜台净仓不符：先按差额补层（只增不减），补不上才要求人工。
+                    # 层账与柜台净仓不符：先按差额补层（只增不减）；柜台少则削层。
                     added = strategy.reconcile_legacy_position()
                     if added <= 0 or not self._layers_match_net(spread, strategy):
-                        raise ManagedSpreadError(
-                            "策略层账与柜台仓位不一致，需人工逐层核对；未做修改")
+                        trimmer = getattr(strategy, "trim_legacy_position", None)
+                        trimmed = float(trimmer() or 0) if callable(trimmer) else 0.0
+                        if trimmed <= 0 or not self._layers_match_net(spread, strategy):
+                            raise ManagedSpreadError(
+                                "策略层账与柜台仓位不一致，需人工逐层核对；未做修改")
+                        trimmed_total += trimmed
                 # 净仓对得上但层结构被合并（如 5 手并成 1 层）：按每层 layer_volume 手重建，
                 # 否则止盈会整层重挂、且只占 1 个层位 → 还能再开 2 层。
                 self._normalize_adopted_layers(name, spread, strategy)
@@ -1727,18 +1802,22 @@ class SpreadTradingControl:
             if isinstance(reports, dict):
                 reports.clear()
         writer = getattr(self.main_engine, "write_log", None)
+        label = self._position_change_label(old, target, config.legs)
         if flat:
-            message = (f"{name} 柜台确认为双腿空仓，本地价差已清零并保存；"
+            message = (f"{name}〔{label}〕柜台确认为双腿空仓，本地价差已清零并保存；"
                        f"归档 {settled_layers} 层历史层账、{len(algoids)} 个无在途委托的旧算法"
                        + ("及已终结的成交记录；" if settled_trades else "；")
                        + "核对状态保留，可直接开启交易")
         else:
             layers = list(getattr(strategy, "layers", []) or [])
             layer_text = "；".join(layer.describe() for layer in layers) or "无"
-            message = (f"{name} 已按柜台仓位同步本地账：{near} {target[near]:g} / {far} {target[far]:g}；"
+            message = (f"{name}〔{label}〕已按柜台仓位同步本地账："
+                       f"{near} {target[near]:g} / {far} {target[far]:g}；"
                        f"策略层账：{layer_text}；核对状态保留，可直接开启交易")
         if pruned:
             message += f"；同时清理了 {pruned} 条与当前仓位/回报不符的旧委托记录"
+        if trimmed_total:
+            message += f"；按柜台削减了 {trimmed_total:g} 手（不产生盈亏，已归档被削的层）"
         if callable(writer):
             try:
                 writer(message)
@@ -1771,6 +1850,17 @@ class SpreadTradingControl:
                 results.append((name, kind, text))
             except Exception as exc:  # noqa: BLE001 - 单个失败不能中断其它合约
                 results.append((name, "fail", str(exc)))
+        # 每个价差一行结论，方便复盘"哪些动了、哪些没动、为什么没动"。
+        writer = getattr(self.main_engine, "write_log", None)
+        if callable(writer):
+            for name, kind, message in results:
+                if kind == "ok":
+                    continue        # 成功的那条已在 sync_spread_position 里写过
+                label = "一致" if kind == "skip" else "未纠正"
+                try:
+                    writer(f"{name}〔{label}〕{message}")
+                except Exception:
+                    pass
         return results
 
     def repair_flat_spread(self, name: str, *, force: bool = False) -> str:
@@ -1951,7 +2041,7 @@ class SpreadTradingControl:
             strategy.pause_strategy()
             strategy.live_trading = False
             raise ManagedSpreadError("发现未受总开关管理的运行策略，已暂停；请先人工核对")
-        if not self.is_reconciled(name):
+        if name not in self.reconciled_contracts:
             raise ManagedSpreadError(
                 f"{name} 尚未人工核对柜台委托、成交及两腿持仓；禁止交易。"
                 "请先选中该合约并点顶部「核对柜台状态」"
@@ -1965,8 +2055,11 @@ class SpreadTradingControl:
         leg_differences = self._cabinet_leg_differences(config, spread)
         td = getattr(self._gateway(), "td_api", None)
         problem = self._snapshot_problem(td)
-        if problem and not self._saved_snapshot_ok(name):
+        if problem:
             raise ManagedSpreadError(f"柜台持仓快照不可用：{problem}；请重新核对")
+        order_problem = self._orders_snapshot_problem(td)
+        if order_problem:
+            raise ManagedSpreadError(order_problem)
         if leg_differences is None and hasattr(td, "position_snapshot_at"):
             raise ManagedSpreadError("柜台与本地持仓无法可靠比较；请重新核对，禁止开启交易")
         if leg_differences is not None and any(
@@ -2048,22 +2141,16 @@ class SpreadTradingControl:
         if enabled:
             if self.master_running:
                 raise ManagedSpreadError("请先停止总交易，再启用其他合约并统一确认启动")
-            try:
-                self.validate(name)
-            except ManagedSpreadError as exc:
-                if not force:
-                    raise
-                writer = getattr(self.main_engine, "write_log", None)
-                if callable(writer):
-                    writer(f"强制开启 {name} 的交易许可：未通过检查（{exc}）")
+            if force:
+                raise ManagedSpreadError("不允许强制绕过合约核对")
+            self.validate(name)
             self.service.set_trading_enabled(name, True)
-            if not force:
-                try:
-                    self.validate(name)  # 配置落盘时仍可能有新的柜台回报。
-                except Exception:
-                    self.service.set_trading_enabled(name, False)
-                    self.enabled.discard(name)
-                    raise
+            try:
+                self.validate(name)  # 配置落盘时仍可能有新的柜台回报。
+            except Exception:
+                self.service.set_trading_enabled(name, False)
+                self.enabled.discard(name)
+                raise
             self.enabled.add(name)
         else:
             self.enabled.discard(name)
@@ -2202,43 +2289,35 @@ class SpreadTradingControl:
             )
         return config
 
-    def start_all(self, *, force: bool = False) -> list[str]:
+    def start_all(self, *, force: bool = False, preopen: bool = False) -> list[str]:
+        """启动全部已勾选合约。
+
+        ``preopen=True`` 允许在没有盘口（未开盘／集合竞价）时先挂好：策略照常
+        初始化、接管层账、绑定委托并恢复（``paused=False``、``trading=True``），
+        但 ``live_trading`` 保持 False，因此不会有任何报单；等 :meth:`tick_armed`
+        看到两腿都有有效报价的那一刻，才逐合约开启实盘发单。默认 ``False`` 时
+        行为不变：没有有效报价直接拒绝启动。
+        """
         if self.master_running:
             raise ManagedSpreadError("总交易已经启动，禁止重复执行初始化")
         if not self.enabled:
             raise ManagedSpreadError("尚未开启任何合约的交易许可")
+        if force:
+            raise ManagedSpreadError("不允许强制绕过柜台核对；请处理差异后普通启动")
         # 先把柜台多出的持仓补进本地账与策略层，否则 validate() 会直接以
         # “本地少仓”拒绝启动，多出来的手数就一直没有策略管（2026-11-11 事故）。
         self._align_cabinet_positions()
         checked: dict[str, SpreadConfig] = {}
-        forced: dict[str, str] = {}
+        arming: list[str] = []
         for name in sorted(self.enabled):
-            try:
-                checked[name] = self.validate(name)
-            except ManagedSpreadError as exc:
-                if not force:
-                    raise
-                config = self.service.get(name)
-                if config is None:
-                    raise
-                checked[name] = config
-                forced[name] = str(exc)
-        if forced:
-            writer = getattr(self.main_engine, "write_log", None)
-            if callable(writer):
-                for name, reason in forced.items():
-                    writer(f"强制开始 {name}：未通过检查（{reason}）；请自行承担未核对风险")
-        # 真正要发单了才要求行情新鲜；许可阶段不因收盘/无报价而卡住。
-        for name, config in checked.items():
-            try:
-                self._validate_quote(config)
-            except ManagedSpreadError:
-                if not force:
-                    raise
-                forced.setdefault(name, "行情报价不新鲜")
-                writer = getattr(self.main_engine, "write_log", None)
-                if callable(writer):
-                    writer(f"强制开始 {name}：行情报价不新鲜，策略可能暂时不发单")
+            config = self.validate(name)
+            problem = self.quote_problem(config)
+            if problem:
+                if not preopen:
+                    raise ManagedSpreadError(problem)
+                arming.append(name)
+            checked[name] = config
+        self.armed.clear()
         started: list[str] = []
         try:
             for name, config in checked.items():
@@ -2261,7 +2340,7 @@ class SpreadTradingControl:
                     strategy.reconcile_legacy_position()
                     # 合并过的接管层在这里按每层 layer_volume 手重建（每层 1 手挂 1 张止盈）
                     self._normalize_adopted_layers(name, spread, strategy)
-                    if not strategy.layers and name not in forced:
+                    if not strategy.layers:
                         raise ManagedSpreadError(
                             f"{name} 存在旧持仓，但两腿仓位不一致或缺少持仓均价，无法自动接管"
                         )
@@ -2273,33 +2352,129 @@ class SpreadTradingControl:
                     self._bind_existing_exit_orders(name, config, strategy, spread)
                 self._bind_existing_open_orders(name, config, strategy)
                 # 初始化/接管期间如果出现柜台回报或核对失效，必须在策略放行前再验一次。
-                if name not in forced:
-                    self.validate(name)
+                self.validate(name)
                 strategy.on_start()  # 安全暂停不改 vn.py trading 标志；每次恢复重建过滤器
                 strategy.trading = True
                 strategy._rebuild_filters()
                 if not strategy.resume_strategy(reconciled=True):
-                    if name not in forced:
-                        raise ManagedSpreadError(f"{name} 暂停期间订单未核对，禁止恢复")
-                    strategy.paused = False  # 用户已明确强制，解除暂停继续
-                if name not in forced:
-                    self.validate(name)
-                strategy.live_trading = True
+                    raise ManagedSpreadError(f"{name} 暂停期间订单未核对，禁止恢复")
+                self.validate(name)
                 writer = getattr(strategy, "write_log", None)
-                if callable(writer):
-                    writer(
-                        "实盘发单已开启（live_trading=True）：此后所有信号都会真实报单；"
-                        "如需纸面观察请先「停止交易」"
-                    )
-                started.append(name)
+                if name in arming:
+                    # 预启动：策略已就绪但不放行实盘；tick_armed() 看到报价再开。
+                    strategy.live_trading = False
+                    self.armed[name] = monotonic() + ARM_MAX_WAIT
+                    if callable(writer):
+                        writer(
+                            "预启动：策略已就绪，但未开启实盘发单（live_trading=False）；"
+                            "两腿报价就绪后自动放行，超时则自动停止"
+                        )
+                else:
+                    strategy.live_trading = True
+                    if callable(writer):
+                        writer(
+                            "实盘发单已开启（live_trading=True）：此后所有信号都会真实报单；"
+                            "如需纸面观察请先「停止交易」"
+                        )
+                    started.append(name)
         except Exception:
             self.stop_all(reason="启动失败，全部策略已暂停")
             raise
         self.master_running = True
+        if self.armed:
+            writer = getattr(self.main_engine, "write_log", None)
+            if callable(writer):
+                writer(
+                    f"预启动：{len(self.armed)} 个合约已就绪，等待开盘报价后自动放行"
+                    f"（最长等待 {ARM_MAX_WAIT:.0f} 秒，超时自动停止且不发任何委托）"
+                )
         return started
+
+    def tick_armed(self) -> list[str]:
+        """预启动看门狗：报价就绪的合约逐个放行，超时／核对失效则整体停止。
+
+        由界面定时器每 500ms 调一次（``SpreadConsoleWidget.arm_timer``）。
+        放行只改 ``live_trading``，不再重跑 validate——核对与持仓校验在 arm
+        时已经做过，这里只补“盘口已经有了”这个唯一缺的条件。
+        """
+        if not self.armed:
+            return []
+        writer = getattr(self.main_engine, "write_log", None)
+
+        def log(message: str) -> None:
+            if callable(writer):
+                writer(message)
+
+        if monotonic() > max(self.armed.values()):
+            self.stop_all(reason="预启动超时：开盘后仍无有效报价，已停止（未发任何委托）")
+            log("预启动超时：等待报价超过 "
+                f"{ARM_MAX_WAIT:.0f} 秒，已停止全部策略（期间没有发出任何委托）")
+            return []
+        td = getattr(self._gateway(), "td_api", None)
+        problem = self._armed_revoked_reason(td)
+        if problem:
+            self.stop_all(reason=f"预启动已撤销：{problem}；请重新核对后手动开始")
+            log(f"预启动已撤销：{problem}；期间没有发出任何委托，请重新核对后再开始")
+            return []
+        released: list[str] = []
+        for name in list(self.armed):
+            config = self.service.get(name)
+            strategy = self._strategy(name) if config is not None else None
+            if config is None or strategy is None:
+                self.armed.pop(name, None)
+                continue
+            if name not in self.reconciled_contracts:
+                self.armed.pop(name, None)
+                log(f"{name} 预启动放行失败：该合约的柜台核对已失效，需重新核对后才能开始")
+                continue
+            if self.quote_problem(config):
+                continue
+            strategy.live_trading = True
+            self.armed.pop(name, None)
+            released.append(name)
+            log(f"{name} 预启动放行：两腿报价已就绪，实盘发单开启（live_trading=True）")
+        if released and not self.armed:
+            log(f"预启动完成：{len(released)} 个合约已全部放行实盘")
+        return released
+
+    @property
+    def armed_names(self) -> list[str]:
+        """仍在等开盘报价的合约（界面用）。"""
+        return sorted(self.armed)
+
+    def _armed_revoked_reason(self, td) -> str:
+        """预启动期间是否必须撤销：只看“核对依据是否已失效”。
+
+        和 :meth:`_snapshot_problem` 的区别：这里不因一次在途查询（``pending``）、
+        短暂的“尚未完整返回”就停手——那是正常的查询节奏，500ms 一次轮询会把它
+        当成致命错误。只有快照过期、账户变了、回报解析失败这类**不可自愈**的
+        情况才撤销。
+        """
+        if td is None:
+            return "交易接口不可用"
+        if hasattr(td, "login_status") and not getattr(td, "login_status", False):
+            return "交易端未登录"
+        if hasattr(td, "contract_inited") and not getattr(td, "contract_inited", False):
+            return "合约目录尚未就绪"
+        sides = getattr(td, "position_snapshot_sides", None)
+        if isinstance(sides, dict):
+            stamp = float(getattr(td, "position_snapshot_at", 0) or 0)
+            if stamp and monotonic() - stamp > SNAPSHOT_MAX_AGE:
+                return f"持仓快照已超过 {SNAPSHOT_MAX_AGE:.0f} 秒，请重新核对"
+            account = getattr(td, "position_snapshot_account", None)
+            if account is not None and account != self._account_key():
+                return "快照账户与当前登录账户不一致，请重新核对"
+        orders_stamp = float(getattr(td, "orders_snapshot_at", 0) or 0)
+        if orders_stamp and monotonic() - orders_stamp > SNAPSHOT_MAX_AGE:
+            return f"当日委托快照已超过 {SNAPSHOT_MAX_AGE:.0f} 秒，请重新核对柜台委托"
+        error = getattr(td, "reconciliation_event_error", "")
+        if error:
+            return f"柜台回报待核实：{error}"
+        return ""
 
     def stop_all(self, *, reason: str = "用户停止交易"):
         self.master_running = False
+        self.armed.clear()
         # 停止交易不等于核对失效：保留几分钟内的核对快照，关窗再开不必重来。
         self.invalidate_reconciliation(forget=False)
         for strategy in self.spread_engine.strategy_engine.strategies.values():

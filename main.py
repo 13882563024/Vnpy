@@ -12,27 +12,34 @@
 不需要另开进程；录下来的数据可直接给 ``run_backtest.py`` 用。
 """
 
-from vnpy.event import EventEngine
-from vnpy.trader.engine import MainEngine
-from vnpy.trader.ui import MainWindow, create_qapp
-
-from vnpy_ctastrategy import CtaStrategyApp
-from vnpy_ctabacktester import CtaBacktesterApp
-from vnpy_riskmanager import RiskManagerApp
-
-from gateway.ctp_spread_gateway import SpreadCtpGateway
-from spreadconsole import SpreadConsoleApp
-from tickbrowser import TickBrowserApp
-from utils.engine_setup import (
-    attach_tick_recorder,
-    attach_trade_recorder,
-    flush_tick_recorder,
-    flush_trade_recorder,
-    setup_spread_trading,
-)
+import sys
 
 
-def main() -> None:
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ['--paper']:
+        from run_spread_paper import main as paper_main
+        return paper_main(args[1:])
+    if args[:1] == ['--workbench']:
+        from run_workbench import main as offline_main
+        return offline_main(args[1:])
+
+    from vnpy.event import EventEngine
+    from vnpy.trader.engine import MainEngine
+    from vnpy.trader.ui import create_qapp
+    from workbench.home_terminal import HomeTerminal
+    from vnpy_ctastrategy import CtaStrategyApp
+    from vnpy_ctabacktester import CtaBacktesterApp
+    from vnpy_riskmanager import RiskManagerApp
+    from gateway.ctp_spread_gateway import SpreadCtpGateway
+    from spreadconsole import SpreadConsoleApp
+    from tickbrowser import TickBrowserApp
+    from utils.engine_setup import (
+        attach_tick_recorder, attach_trade_recorder, flush_tick_recorder,
+        flush_trade_recorder, setup_spread_trading,
+    )
+    from workbench.terminal import install_workbench_menu
+
     qapp = create_qapp()
 
     # 监控面板的「时间」列补上日期（跨日复盘时分得清夜盘与日盘）
@@ -89,10 +96,11 @@ def main() -> None:
     qapp.aboutToQuit.connect(
         lambda: flush_trade_recorder(trade_recorder, main_engine.write_log))
 
-    window = MainWindow(main_engine, event_engine)
+    window = HomeTerminal(main_engine, event_engine, spread_engine)
+    install_workbench_menu(window)
     window.showMaximized()
     qapp.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

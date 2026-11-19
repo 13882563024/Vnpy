@@ -1,4 +1,4 @@
-﻿"""价差管理 GUI 控制器的无柜台门禁与真实 Qt 生命周期测试。"""
+"""价差管理 GUI 控制器的无柜台门禁与真实 Qt 生命周期测试。"""
 from __future__ import annotations
 
 import os
@@ -876,7 +876,7 @@ class ControlTests(unittest.TestCase):
         restarted.enable(self.config.name, True)
         self.assertIn(self.config.name, restarted.enabled)
 
-    def test_reconciliation_survives_restart_through_state_file(self):
+    def test_saved_snapshot_cannot_authorize_restart(self):
         self._stale_spread_and_snapshot()
         self.spread.leg_pos = {self.config.legs[0]: 0, self.config.legs[1]: 0}
         self.spread.net_pos = 0
@@ -885,10 +885,11 @@ class ControlTests(unittest.TestCase):
         restarted = SpreadTradingControl(
             self.main, self.spread_engine, self.service,
             state_path=Path(self.temp.name) / "state.json")
-        restarted.refresh()  # 首次读注册表、尚未重连，都不能清掉上次核对
-        self.assertTrue(restarted.is_reconciled(self.config.name))
-        restarted.enable(self.config.name, True)
-        self.assertIn(self.config.name, restarted.enabled)
+        restarted.refresh()
+        self.assertFalse(restarted.is_reconciled(self.config.name))
+        with self.assertRaises(ManagedSpreadError):
+            restarted.enable(self.config.name, True)
+        self.assertIsNone(restarted._cabinet_leg_differences(self.config, self.spread))
 
     def test_restart_remembers_unfinished_orders(self):
         self._stale_spread_and_snapshot()
@@ -907,15 +908,15 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(any("CTP.1" in detail and "上次会话" in detail
                             for detail in report["pending_details"]))
 
-    def test_force_enable_bypasses_failed_checks_after_confirmation(self):
+    def test_force_enable_cannot_bypass_failed_checks(self):
         self._stale_spread_and_snapshot()
         with self.assertRaisesRegex(ManagedSpreadError, "本地与柜台持仓不一致"):
             self.control.enable(self.config.name, True)
-        self.control.enable(self.config.name, True, force=True)
-        self.assertIn(self.config.name, self.control.enabled)
-        self.assertTrue(self.service.get(self.config.name).trading_enabled)
+        with self.assertRaisesRegex(ManagedSpreadError, "不允许强制"):
+            self.control.enable(self.config.name, True, force=True)
+        self.assertNotIn(self.config.name, self.control.enabled)
 
-    def test_start_all_requires_fresh_quote_unless_forced(self):
+    def test_start_all_requires_fresh_quote_even_when_forced(self):
         self.control.enabled.add(self.config.name)
         stale = datetime.now() - timedelta(seconds=30)
         self.main.get_tick = lambda _: SimpleNamespace(
@@ -923,17 +924,102 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ManagedSpreadError, "报价超过 5 秒"):
             self.control.start_all()
         self.assertFalse(self.control.master_running)
-        # 休盘/断线时用户确认后仍可先启动策略，等新报价再发单
-        self.assertEqual(self.control.start_all(force=True), [self.config.name])
+        # 无有效报价不能以人工强制操作绕过门禁。
+        with self.assertRaisesRegex(ManagedSpreadError, "不允许强制"):
+            self.control.start_all(force=True)
+        self.assertFalse(self.control.master_running)
+
+    def test_preopen_start_arms_without_sending_any_order(self):
+        """盘前点「开始交易」：策略就绪但不放行实盘，等两腿报价到了再开。"""
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None          # 未开盘：没有盘口
+        started = self.control.start_all(preopen=True)
+
+        self.assertEqual(started, [])
+        self.assertTrue(self.control.master_running)
+        self.assertEqual(self.control.armed_names, [self.config.name])
+        self.assertFalse(self.strategy.live_trading)   # 关键：没有放行实盘
+        self.assertFalse(self.strategy.paused)         # 但已经恢复，不是暂停态
+        self.assertEqual(self.strategy.resume_count, 1)
+        # 默认行为不变：没有报价时普通启动仍然被拒。
+        self.control.stop_all()
+        self.control.confirm_reconciliation()
+        with self.assertRaisesRegex(ManagedSpreadError, "无有效买一/卖一报价"):
+            self.control.start_all()
+
+    def test_preopen_releases_when_quotes_arrive(self):
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None
+        self.control.start_all(preopen=True)
+        self.assertFalse(self.strategy.live_trading)
+
+        self.main.get_tick = lambda _: SimpleNamespace(
+            bid_price_1=100, ask_price_1=101, datetime=datetime.now())
+        released = self.control.tick_armed()
+
+        self.assertEqual(released, [self.config.name])
+        self.assertEqual(self.control.armed, {})
+        self.assertTrue(self.strategy.live_trading)
         self.assertTrue(self.control.master_running)
 
-    def test_force_start_skips_blocking_checks(self):
+    def test_preopen_times_out_and_stops(self):
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None
+        self.control.start_all(preopen=True)
+        self.control.armed[self.config.name] = monotonic() - 1     # 已过截止时间
+
+        self.assertEqual(self.control.tick_armed(), [])
+
+        self.assertFalse(self.control.master_running)
+        self.assertFalse(self.strategy.live_trading)
+        self.assertTrue(self.strategy.paused)
+
+    def test_preopen_revoked_when_snapshot_expires(self):
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None
+        self.control.start_all(preopen=True)
+        td = self.gateway.td_api
+        td.position_snapshot_sides = {}
+        td.position_snapshot_account = ("", "")
+        td.position_snapshot_at = monotonic() - 10_000
+
+        self.control.tick_armed()
+
+        self.assertFalse(self.control.master_running)
+        self.assertEqual(self.control.armed, {})
+        self.assertFalse(self.strategy.live_trading)
+
+    def test_preopen_arm_does_not_survive_stop(self):
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None
+        self.control.start_all(preopen=True)
+        self.assertTrue(self.control.armed)
+
+        self.control.stop_all()
+
+        self.assertEqual(self.control.armed, {})
+        self.assertEqual(self.control.armed_names, [])
+
+    def test_force_start_cannot_skip_blocking_checks(self):
         self._stale_spread_and_snapshot()
         self.control.enabled.add(self.config.name)
         with self.assertRaisesRegex(ManagedSpreadError, "本地与柜台持仓不一致"):
             self.control.start_all()
-        self.assertEqual(self.control.start_all(force=True), [self.config.name])
-        self.assertTrue(self.control.master_running)
+        with self.assertRaisesRegex(ManagedSpreadError, "不允许强制"):
+            self.control.start_all(force=True)
+        self.assertFalse(self.control.master_running)
+
+    def test_cold_start_does_not_resurrect_terminal_order(self):
+        self.control._saved_orders = {self.config.name: [{'orderid':'CTP.1_2_3',
+            'vt_symbol':self.config.legs[0], 'direction':'多', 'offset':'开',
+            'volume':2, 'traded':0, 'price':4000, 'status':'未成交'}]}
+        self.control._orders_restored = False
+        oms = SimpleNamespace(process_order_event=Mock(), active_orders={},
+                              orders={'CTP.1_2_3':SimpleNamespace(status=Status.CANCELLED)})
+        self.main.get_engine = lambda name: oms if name == 'oms' else None
+        self.assertEqual(self.control.restore_orders(), 0)
+        oms.process_order_event.assert_not_called()
+        self.assertEqual(oms.active_orders, {})
 
     def test_restores_last_session_orders_into_oms_and_spread_map(self):
         self._stale_spread_and_snapshot()
@@ -1034,6 +1120,16 @@ class ControlTests(unittest.TestCase):
         self.assertIn("平仓槽位 第1层（空1手）：占用", text)
         self.assertIn("空/平", text)
         self.assertIn("@-14", text)
+
+    def test_unowned_order_not_displayed_as_covering_each_layer(self):
+        from spreadconsole.ui.widget import _slot_lines
+        layers = [SimpleNamespace(tier_id=t, direction=1, volume=1) for t in ('L1','L2')]
+        strategy = SimpleNamespace(layers=layers, reserved_exit_orders={'CTP.orphan':''})
+        text = '\n'.join(_slot_lines(strategy))
+        self.assertEqual(text.count('CTP.orphan'), 1)
+        self.assertIn('非顶层，按策略不挂止盈', text)
+        self.assertIn('未见止盈记录，请核对柜台', text)
+        self.assertIn('未归属任何存续层', text)
 
     def test_slot_lines_show_pending_action_with_price(self):
         from spreadconsole.ui.widget import _slot_lines
@@ -1156,6 +1252,43 @@ class ControlTests(unittest.TestCase):
         self.assertIn("清理了 1 条", result)     # 核对纠正时自动更新本地委托
         self.assertEqual(restarted._recovered_orderids, set())
         self.assertNotIn("CTP.1_2_3", oms.orders)
+
+    def test_prune_keeps_order_matched_by_exchange_sysid(self):
+        """重启后会话号变了，但交易所委托号不变：按 sysid 认定柜台仍在，不能清。"""
+        td = self.gateway.td_api
+        td.orders_snapshot_ok = True
+        td.orders_snapshot_at = monotonic()
+        td.orders_snapshot = {"CTP.9_111_5"}            # 会话号对不上（新进程）
+        td.orders_snapshot_sysids = {"SYS-1": "CTP.1_2_3"}
+        td.sysid_orderid_map = {"SYS-1": "1_2_3"}
+        self.control._saved_orders = {"A_2701_2703": [{
+            "orderid": "CTP.1_2_3", "vt_symbol": self.config.legs[0],
+            "direction": "多", "offset": "平", "volume": 1, "traded": 0,
+            "price": 4000, "status": "未成交"}]}
+        self.control._recovered_orderids = {"CTP.1_2_3"}
+
+        pruned = self.control._prune_orders_absent_from_cabinet(self.config.name, self.config)
+
+        self.assertEqual(pruned, 0)
+        self.assertIn("CTP.1_2_3", self.control._recovered_orderids)
+
+    def test_prune_drops_order_absent_by_both_session_and_sysid(self):
+        td = self.gateway.td_api
+        td.orders_snapshot_ok = True
+        td.orders_snapshot_at = monotonic()
+        td.orders_snapshot = {"CTP.9_111_5"}
+        td.orders_snapshot_sysids = {"SYS-9": "CTP.9_111_5"}
+        td.sysid_orderid_map = {"SYS-9": "9_111_5"}
+        self.control._saved_orders = {"A_2701_2703": [{
+            "orderid": "CTP.1_2_3", "vt_symbol": self.config.legs[0],
+            "direction": "多", "offset": "平", "volume": 1, "traded": 0,
+            "price": 4000, "status": "未成交"}]}
+        self.control._recovered_orderids = {"CTP.1_2_3"}
+
+        pruned = self.control._prune_orders_absent_from_cabinet(self.config.name, self.config)
+
+        self.assertEqual(pruned, 1)
+        self.assertNotIn("CTP.1_2_3", self.control._recovered_orderids)
 
     def test_sync_prunes_close_order_with_same_direction_as_layer(self):
         """多/平 与当前多头层同向，不可能是平它的单，属于历史残留。"""
@@ -1490,6 +1623,58 @@ class WidgetTests(unittest.TestCase):
         widget = SpreadConsoleWidget(engine, None)
         self.addCleanup(widget.close)
         return widget, control
+
+    def test_master_start_auto_reconciles_without_asking(self):
+        """点「开始交易」时没有有效核对：先自动核对并纠正，不弹核对确认窗口。"""
+        widget, control = self._make_widget(master_running=False)
+        control.enabled = {"A_2701_2703"}
+        control.is_reconciled.return_value = False
+        with patch.object(widget, "_confirm_reconciliation") as reconcile, \
+                patch.object(widget, "_start_trading") as start:
+            widget._toggle_master()
+
+        reconcile.assert_called_once_with(batch=True)
+        start.assert_not_called()
+        self.assertTrue(widget._pending_start)
+        self.assertTrue(widget._auto_mode)
+
+    def test_batch_sync_success_starts_trading_without_second_click(self):
+        widget, control = self._make_widget(master_running=False)
+        widget._pending_start = True
+        widget._auto_mode = True
+        control.sync_all.return_value = [("A_2701_2703", "ok", "")]
+        with patch.object(widget, "_start_trading") as start:
+            widget._run_batch_sync([])
+
+        start.assert_called_once()
+        self.assertFalse(widget._pending_start)
+        self.assertFalse(widget._auto_mode)
+
+    def test_batch_sync_failure_does_not_autostart(self):
+        widget, control = self._make_widget(master_running=False)
+        control.enabled = {"A_2701_2703"}
+        widget._pending_start = True
+        widget._auto_mode = True
+        control.sync_all.return_value = [("A_2701_2703", "fail", "柜台两腿仓位不匹配")]
+        with patch.object(widget, "_start_trading") as start, \
+                patch.object(QtWidgets.QMessageBox, "warning"):
+            widget._run_batch_sync([])
+
+        start.assert_not_called()
+        self.assertFalse(widget._pending_start)
+
+    def test_batch_sync_ignores_failure_of_contracts_not_enabled(self):
+        """PK 这类没勾选交易的合约纠正失败，不该拦住其它合约启动。"""
+        widget, control = self._make_widget(master_running=False)
+        control.enabled = {"A_2701_2703"}
+        widget._pending_start = True
+        widget._auto_mode = True
+        control.sync_all.return_value = [("PK_701_703", "fail", "柜台两腿仓位不匹配")]
+        with patch.object(widget, "_start_trading") as start:
+            widget._run_batch_sync([])
+
+        start.assert_called_once()
+        self.assertFalse(widget._pending_start)
 
     def test_close_window_keeps_strategy_running(self):
         """2026-11-11 反馈：叉掉价差窗口后策略要留在后台继续跑。"""
