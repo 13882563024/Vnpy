@@ -459,6 +459,48 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(dropped, 0)
         self.assertIn("CTP.old", self.control._recovered_orderids)
 
+    def test_unreconciled_account_accepts_self_built_layers(self):
+        """策略自己开的层（非接管）只要合计与柜台一致，就不能拦开启交易。
+
+        2026-11-20 A/RM 实测：层账 1 层 1 手 vs 柜台 1 手完全一致，却因为
+        ``_adopted_layers_ok`` 要求“每层都是接管来的”、``_can_adopt_legacy`` 要求
+        “一层都没有”，两条都不满足而禁止开启交易。
+        """
+        self._stale_spread_and_snapshot()
+        self.spread.leg_pos = {self.config.legs[0]: 1, self.config.legs[1]: -1}
+        self.spread.net_pos = 1
+        self.gateway.td_api.position_snapshot_sides = {
+            "a2701": {"long": 1, "short": 0},
+            "a2703": {"long": 0, "short": 1},
+        }
+        self.strategy.pause_trade_reports = {}
+        self.strategy.layers = [SimpleNamespace(
+            direction=1, volume=1, is_open=True, adopted=False, tier_id="t1")]
+
+        self.assertEqual(
+            self.control._unreconciled_account(self.config, allow_adopted=True), "")
+
+    def test_unreconciled_account_blocks_mismatched_layers(self):
+        """层账合计与柜台净仓不符时仍然必须拦（不能因为宽松而放过真问题）。"""
+        self._stale_spread_and_snapshot()
+        self.spread.leg_pos = {self.config.legs[0]: 1, self.config.legs[1]: -1}
+        self.spread.net_pos = 1
+        self.gateway.td_api.position_snapshot_sides = {
+            "a2701": {"long": 1, "short": 0},
+            "a2703": {"long": 0, "short": 1},
+        }
+        self.strategy.pause_trade_reports = {}
+        self.strategy.layers = [
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=False,
+                            tier_id="t1"),
+            SimpleNamespace(direction=1, volume=1, is_open=True, adopted=False,
+                            tier_id="t2"),
+        ]
+
+        self.assertIn(
+            "逐层持仓尚未对账",
+            self.control._unreconciled_account(self.config, allow_adopted=True))
+
     def test_stop_never_calls_engine_stop_or_cancel(self):
         self.control.enabled.add(self.config.name)
         self.control.master_running = True

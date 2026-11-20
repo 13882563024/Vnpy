@@ -1979,27 +1979,33 @@ class SpreadTradingControl:
         if cabinet is not None:
             if any(abs(leg["cabinet"]) > 1e-9 or (leg["long"] > 1e-9 and leg["short"] > 1e-9)
                    for leg in cabinet):
-                if allow_adopted:
-                    strategy = self._strategy(config.name)
-                    spread = self.spread_engine.get_spread(config.name)
-                    if strategy is not None and spread is not None and (
-                            self._adopted_layers_ok(config.name, spread, strategy)
-                            or self._can_adopt_legacy(strategy)):
-                        return ""
+                if allow_adopted and self._layers_reconciled(config.name):
+                    return ""
                 return "柜台已有单腿持仓，逐层持仓尚未对账；为防止错误开平仓，禁止恢复"
             return ""
         positions = [p for p in self.main_engine.get_all_positions()
                      if p.vt_symbol in config.legs and p.volume]
         if positions:
-            if allow_adopted:
-                strategy = self._strategy(config.name)
-                spread = self.spread_engine.get_spread(config.name)
-                if strategy is not None and spread is not None and (
-                        self._adopted_layers_ok(config.name, spread, strategy)
-                        or self._can_adopt_legacy(strategy)):
-                    return ""
+            if allow_adopted and self._layers_reconciled(config.name):
+                return ""
             return "柜台已有单腿持仓，逐层持仓尚未对账；为防止错误开平仓，禁止恢复"
         return ""
+
+    def _layers_reconciled(self, name: str) -> bool:
+        """本地层账是否已与柜台对得上（接管层 **或** 策略自己开的层都算）。
+
+        早先这里只认 ``_adopted_layers_ok``（要求每层都是启动时接管的）和
+        ``_can_adopt_legacy``（要求一层都没有）。策略自己开仓建立的层（adopted=False）
+        两条都不满足，于是即便层账与柜台净仓完全一致，也会被判成“逐层持仓尚未对账”
+        而禁止开启交易（2026-11-20 A/RM 实测：1 层 1 手 vs 柜台 1 手，仍被拦）。
+        """
+        strategy = self._strategy(name)
+        spread = self.spread_engine.get_spread(name)
+        if strategy is None or spread is None:
+            return False
+        return (self._adopted_layers_ok(name, spread, strategy)
+                or self._layers_match_net(spread, strategy)
+                or self._can_adopt_legacy(strategy))
 
     def _sync_flat_caches(self, config: SpreadConfig) -> None:
         """柜台已确认双腿空仓：清掉本机 OMS 旧腿仓和抵扣转换器持仓。
