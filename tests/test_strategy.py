@@ -590,6 +590,10 @@ class TestStopLoss(unittest.TestCase):
         self.assertEqual(len(strategy.layers), 2)
         self.assertIn(3, [layer.layer_index for layer in strategy.closed_layers])
         self.assertEqual([layer.layer_index for layer in strategy.layers], [1, 2])
+        exits = engine.active_algos("take_profit")
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0].extra["tier_id"], strategy.layers[-1].tier_id)
+        self.assertEqual(exits[0].extra["expected_close_legs"], (2, -2))
 
     def test_allow_stop_loss_false_skips_tier_stop(self) -> None:
         """allow_stop_loss=False 时不砍浮亏（时间止损/换月强平仍生效）。"""
@@ -703,6 +707,42 @@ class TestTierManagement(unittest.TestCase):
         exit_algos = engine.active_algos("take_profit")
         self.assertEqual(len(exit_algos), 1)
         self.assertAlmostEqual(exit_algos[0].volume, 1)
+
+    def test_layer_switch_does_not_back_off_intentionally_cancelled_exit(self) -> None:
+        strategy, engine, spread = make_strategy({"max_positions": 3, "layer_step": 0.3,
+                                                 "exit_retry_backoff": "120"})
+        warm_up(strategy, [-100.0, -100.4] * 20)
+        feed_quote(spread, 4000, 4001, 4102, 4103)
+        strategy.on_spread_data()
+        engine.fill(engine.active_algos("open")[0].algoid, price=-101.0)
+        first_layer = strategy.layers[0]
+
+        feed_quote(spread, 4000, 4001, 4104, 4105, moment=MOMENT + timedelta(seconds=3))
+        strategy.on_spread_data()
+        engine.fill(engine.active_algos("open")[0].algoid, price=-103.0)
+        engine.fill(engine.active_algos("take_profit")[0].algoid)
+
+        exits = engine.active_algos("take_profit")
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0].extra["tier_id"], first_layer.tier_id)
+        self.assertEqual(first_layer.retry_count, 0)
+        self.assertNotIn(first_layer.tier_id, strategy._exit_retry_at)
+
+    def test_position_refresh_rechecks_exit_without_new_quote(self) -> None:
+        strategy, engine, spread = make_strategy()
+        warm_up(strategy, [-100.0, -100.4] * 20)
+        feed_quote(spread, 4000, 4001, 4102, 4103)
+        strategy.on_spread_data()
+        strategy.cabinet_position_check = lambda direction, volume: False
+        engine.fill(engine.active_algos("open")[0].algoid, price=-101.0)
+        strategy.on_spread_pos()
+        self.assertEqual(engine.active_algos("take_profit"), [])
+
+        spread.net_pos = 1
+        strategy.cabinet_position_check = lambda direction, volume: True
+        strategy.on_spread_pos()
+        strategy.on_spread_pos()
+        self.assertEqual(len(engine.active_algos("take_profit")), 1)
 
     def test_max_positions_caps_layers(self) -> None:
         strategy, engine, spread = make_strategy({"max_positions": 1})

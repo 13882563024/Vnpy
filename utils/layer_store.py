@@ -19,7 +19,8 @@ def _path() -> Path:
     return Path(get_file_path("spread_layers.json"))
 
 
-def _read() -> dict:
+def read_all() -> dict:
+    """读取完整本地文件，供只读界面一次构建所有行。"""
     try:
         raw = json.loads(_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -28,14 +29,14 @@ def _read() -> dict:
 
 
 def load(name: str) -> list[dict]:
-    rows = _read().get(name)
+    rows = read_all().get(name)
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
 
 
 def save(name: str, layers: list[dict]) -> None:
-    data = _read()
+    data = read_all()
     data[name] = list(layers)
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +46,7 @@ def save(name: str, layers: list[dict]) -> None:
 
 
 def clear(name: str) -> None:
-    data = _read()
+    data = read_all()
     if data.pop(name, None) is not None:
         path = _path()
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

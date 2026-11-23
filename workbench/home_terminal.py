@@ -1,15 +1,22 @@
 """The normal vn.py window, with a read-only first screen and its original dock layout."""
 import json
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QDialog, QDockWidget, QLabel, QPlainTextEdit, QToolBar, QVBoxLayout
 from vnpy.trader.ui import MainWindow
 
+from utils import layer_store, pnl_ledger
+
 from .model import DEFAULT_CONFIG, load_snapshot
-from .overview_data import overview_view
+from .overview_data import UNKNOWN, OverviewCacheBusy, overview_view
 from .overview_page import OverviewPage
+
+
+# Do not let an unresponsive gateway masquerade as a live snapshot.
+BUSY_VIEW_MAX_AGE = 5.0
 
 
 class HomeTerminal(MainWindow):
@@ -22,6 +29,8 @@ class HomeTerminal(MainWindow):
         self._revision = None
         self._configs = {}
         self._rows = {}
+        self._last_view = None
+        self._last_view_at = 0.0
         self._detail = None
         self._detail_key = ('', '')
         self.home = OverviewPage(self)
@@ -104,11 +113,27 @@ class HomeTerminal(MainWindow):
         except (ValueError, OSError) as exc:
             problem = f'配置读取失败：{exc}'
         try:
-            view = overview_view(self._configs, self.main_engine, self._spread_engine)
+            view = overview_view(self._configs, self.main_engine, self._spread_engine,
+                                 read_local=lambda: (layer_store.read_all(), pnl_ledger.read_all()))
+        except OverviewCacheBusy:
+            # A busy writer is transient. Keep the whole last frame rather than mixing it
+            # with placeholders, and keep its original timestamp visible.
+            if self._last_view is not None and monotonic() - self._last_view_at <= BUSY_VIEW_MAX_AGE:
+                view = dict(self._last_view)
+                view['updated'] += '（柜台刷新中，显示上次数据）'
+            else:
+                view = overview_view(self._configs)
+                view['connection'] = '柜台刷新中，状态待确认'
+                for key in ('balance', 'available', 'margin', 'realized', 'unrealized'):
+                    view[key] = UNKNOWN
+                problem = problem or '暂未取得可展示的柜台数据'
         except Exception:
-            # Concurrent cache updates are possible; do not leave old values on screen as current.
+            self._last_view = None
             view = overview_view(self._configs)
-            problem = '本轮终端数据不可用，等待刷新'
+            problem = problem or '本轮终端数据不可用，等待刷新'
+        else:
+            self._last_view = view.copy()
+            self._last_view_at = monotonic()
         if problem:
             view['source'] = problem
         self._rows = {r['name']: r for r in view['rows']}

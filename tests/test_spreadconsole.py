@@ -1401,10 +1401,88 @@ class ControlTests(unittest.TestCase):
         results = self.control.sync_all()
         self.assertEqual(results[0][1], "skip")
 
-    def test_sync_all_rejects_while_master_running(self):
+    def _running_repair(self):
+        self._stale_spread_and_snapshot()
         self.control.master_running = True
-        with self.assertRaisesRegex(ManagedSpreadError, "先停止总交易"):
-            self.control.sync_all()
+        self.control.enabled.add(self.config.name)
+        self.strategy.paused = False
+        self.strategy.live_trading = True
+        self.other = MockStrategy()
+        self.other.live_trading = True
+        self.spread_engine.strategy_engine.strategies['other'] = self.other
+
+    def test_sync_all_repairs_only_target_and_restores_live_permission(self):
+        self._running_repair()
+        def check_saved():
+            self.assertFalse(self.strategy.live_trading)
+            self.assertTrue(self.strategy.paused)
+            self.assertTrue(self.other.live_trading)
+        self.spread_engine.data_engine.save_pos.side_effect = check_saved
+        with patch.object(self.control, 'quote_problem', return_value=''):
+            results = self.control.sync_all()
+        self.assertEqual(results[0][1], 'ok', results)
+        self.assertIn('已恢复交易', results[0][2])
+        self.assertTrue(self.control.master_running)
+        self.assertTrue(self.strategy.live_trading)
+        self.assertEqual(self.other.pause_count, 0)
+
+    def test_running_repair_leaves_target_paused_when_restart_guard_fails(self):
+        self._running_repair()
+        with patch.object(self.control, 'quote_problem', return_value='盘口过旧'):
+            result = self.control.sync_spread_position(self.config.name)
+        self.assertIn('该合约保持暂停：盘口过旧', result)
+        self.assertTrue(self.strategy.paused)
+        self.assertFalse(self.strategy.live_trading)
+        self.assertTrue(self.other.live_trading)
+
+    def test_running_repair_trims_three_real_layers_to_two(self):
+        from execution.base import PositionLayer
+        from strategies.cross_period_mean_reversion import CrossPeriodMRStrategy
+
+        self._running_repair()
+        near, far = self.config.legs
+        self.gateway.td_api.position_snapshot_sides = {
+            'a2701': {'long': 2, 'short': 0}, 'a2703': {'long': 0, 'short': 2}}
+        # The engine's leg positions are already current, but the layer book is not.
+        self.spread.leg_pos = {near: 2, far: -2}
+        self.spread.net_pos = 2
+        self.spread.calculate_pos.side_effect = lambda: setattr(self.spread, 'net_pos', self.spread.leg_pos[near])
+        self.strategy.layers = [PositionLayer(layer_index=i, volume=1, avg_spread=-i)
+                                for i in (1, 2, 3)]
+        self.strategy.closed_layers = []
+        self.strategy.spread = self.spread
+        self.strategy._snapshot = None
+        self.strategy._refresh_variables = self.strategy._save_layers = self.strategy.write_log = Mock()
+        self.strategy.trim_legacy_position = lambda: CrossPeriodMRStrategy.trim_legacy_position(self.strategy)
+        with patch.object(self.control, 'quote_problem', return_value=''):
+            self.control.confirm_reconciliation()
+            result = self.control.sync_spread_position(self.config.name)
+        self.assertIn('削减了 1 手', result)
+        self.assertEqual([layer.avg_spread for layer in self.strategy.layers], [-1, -2])
+        self.assertEqual(self.strategy.closed_layers[0].realized_pnl, 0)
+        self.assertEqual(self.spread.leg_pos, {near: 2, far: -2})
+
+    def test_running_repair_defers_while_live_algo_is_inflight(self):
+        self._running_repair()
+        self.spread_engine.algo_engine.algos['working'] = SimpleNamespace(is_order_finished=lambda: False)
+        state = self.strategy.get_pause_state()
+        state['active_algoids'] = ['working']
+        with patch.object(self.strategy, 'get_pause_state', return_value=state):
+            with self.assertRaisesRegex(ManagedSpreadError, '算法仍在途'):
+                self.control.sync_spread_position(self.config.name, force=True)
+        self.assertTrue(self.strategy.live_trading)
+        self.assertFalse(self.strategy.paused)
+        self.spread_engine.data_engine.save_pos.assert_not_called()
+
+    def test_running_repair_does_not_pause_already_consistent_target(self):
+        self._running_repair()
+        for key in self.spread.leg_pos:
+            self.spread.leg_pos[key] = 0
+        self.spread.net_pos = 0
+        pauses = self.strategy.pause_count
+        self.assertEqual(self.control.sync_all()[0][1], 'skip')
+        self.assertTrue(self.strategy.live_trading)
+        self.assertEqual(self.strategy.pause_count, pauses)
 
     def test_clear_contract_orders_keeps_algorithm_owned_orders(self):
         oms = SimpleNamespace(
@@ -1665,6 +1743,18 @@ class WidgetTests(unittest.TestCase):
         widget = SpreadConsoleWidget(engine, None)
         self.addCleanup(widget.close)
         return widget, control
+
+    def test_selected_repair_starts_fresh_query_while_trading(self):
+        widget, control = self._make_widget(master_running=True)
+        def begin_query():
+            widget._reconciliation_pending = True
+        with patch.object(widget, '_name', return_value='X'), \
+                patch.object(widget, '_confirm_reconciliation', side_effect=begin_query) as query, \
+                patch.object(QtWidgets.QMessageBox, 'question', return_value=QtWidgets.QMessageBox.StandardButton.Yes):
+            widget._repair_selected_position()
+        query.assert_called_once_with()
+        self.assertEqual(widget._repair_target, 'X')
+        control.sync_spread_position.assert_not_called()
 
     def test_master_start_auto_reconciles_without_asking(self):
         """点「开始交易」时没有有效核对：先自动核对并纠正，不弹核对确认窗口。"""

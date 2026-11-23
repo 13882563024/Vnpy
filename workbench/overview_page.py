@@ -223,12 +223,14 @@ class OverviewPage(QWidget):
             label.setText(value)
             label.setToolTip(value)
         previous = self._current().get('name')
+        previous_column = max(self.table.currentColumn(), 0)
         rows = sorted((dict(row) for row in (view.get('rows') or [])),
                       key=lambda row: row.get('priority', float('inf')))
         if rows != self._rows:
             with QSignalBlocker(self.table):
                 self._rows = rows
-                self.table.setRowCount(len(rows))
+                if self.table.rowCount() != len(rows):
+                    self.table.setRowCount(len(rows))
                 selected = 0
                 for i, row in enumerate(rows):
                     if previous and row.get('name') == previous:
@@ -238,20 +240,26 @@ class OverviewPage(QWidget):
                         tooltip = value
                         if key == 'log' and len(value) > 52:
                             value = value[:51] + '…'      # 单元格截短，悬停看全文
-                        item = QTableWidgetItem(value)
-                        item.setToolTip(tooltip)
+                        item = self.table.item(i, j)
+                        if item is None:
+                            item = QTableWidgetItem()
+                            self.table.setItem(i, j, item)
+                        if item.text() != value:
+                            item.setText(value)
+                        if item.toolTip() != tooltip:
+                            item.setToolTip(tooltip)
                         # The terminal ships a dark global palette; set our own text colour so
                         # selected rows stay readable instead of inheriting white on mint.
-                        item.setForeground(QColor('#163640'))
-                        if key == 'status' and row.get('priority') in (0, 1):
-                            item.setForeground(QColor('#963c26' if row['priority'] == 0 else '#775515'))
-                            font = item.font()
-                            font.setBold(True)
+                        priority = row.get('priority') if key == 'status' else None
+                        color = QColor({0: '#963c26', 1: '#775515'}.get(priority, '#163640'))
+                        if item.foreground().color() != color:
+                            item.setForeground(color)
+                        font = item.font()
+                        if font.bold() != (priority in (0, 1)):
+                            font.setBold(priority in (0, 1))
                             item.setFont(font)
-                        self.table.setItem(i, j, item)
-                if rows:
-                    self.table.setCurrentCell(selected, 0)
-                self.table.resizeColumnsToContents()
+                if rows and self.table.currentRow() != selected:
+                    self.table.setCurrentCell(selected, previous_column)
         self.table.setVisible(bool(rows))
         self._empty.setVisible(not rows)
         held = sum(r.get('held') is True for r in rows)

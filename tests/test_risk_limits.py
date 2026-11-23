@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -54,6 +55,23 @@ class RiskLimitsTests(unittest.TestCase):
         self.assertIsInstance(usage, AccountUsage)
         self.assertAlmostEqual(usage.ratio, 0.8)
         self.assertEqual(usage.balance, 100_000.0)
+
+    def test_opening_requires_recent_funds_from_current_login(self):
+        token = object()
+        td = SimpleNamespace(userid='u', login_status=True, account_cache_token=token)
+        cached = SimpleNamespace(gateway_name='CTP', accountid='u', balance=100, available=80,
+                                 ctp_cache_token=token, ctp_observed_at=80.0)
+        other = SimpleNamespace(gateway_name='CTP', accountid='old', balance=100, available=0,
+                                ctp_cache_token=token, ctp_observed_at=99.0)
+        engine = SimpleNamespace(gateways={'CTP': SimpleNamespace(td_api=td)},
+                                 get_all_accounts=lambda: [cached, other])
+        with patch('utils.risk_limits.monotonic', return_value=100.0):
+            self.assertEqual(account_usage(engine, require_fresh=True).balance, 100)
+            cached.ctp_observed_at = 70.0
+            self.assertIsNone(account_usage(engine, require_fresh=True))
+            cached.ctp_observed_at = 100.0
+            td.account_cache_token = object()
+            self.assertIsNone(account_usage(engine, require_fresh=True))
 
     def test_no_account_data_returns_none(self):
         self.assertIsNone(account_usage(SimpleNamespace(get_all_accounts=lambda: [])))

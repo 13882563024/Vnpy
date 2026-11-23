@@ -224,7 +224,7 @@ class TestPauseGate(unittest.TestCase):
                    return_value=False):
             strategy.on_spread_algo(algo)
         self.assertEqual(len(strategy.layers), 1)
-        self.assertTrue(any("挂出止盈单" in message for message in strategy.strategy_engine.logs),
+        self.assertTrue(any("启动止盈算法" in message for message in strategy.strategy_engine.logs),
                         strategy.strategy_engine.logs)
 
     def test_unknown_or_missing_exchange_mode_never_degrades_to_two_leg(self):

@@ -186,6 +186,7 @@ class AlgoJob:
     reason: str = ""
     created_at: float = field(default_factory=time.time)
     done: bool = False
+    cancel_for_transition: bool = False
 
 
 class AlgoImpl(Protocol):

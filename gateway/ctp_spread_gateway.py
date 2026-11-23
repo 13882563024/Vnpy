@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from functools import wraps
+from math import isfinite
+from sys import float_info
 from threading import RLock
 import json
 from pathlib import Path
@@ -122,6 +124,10 @@ def _serialized_send_state(fn):
 class SpreadCtpTdApi(CtpTdApi):
     """交易 API 子类：组合单回报容错 + 可选两位 ``CombOffsetFlag``。"""
 
+    ACCOUNT_POLL_SECONDS = 15.0
+    POSITION_POLL_SECONDS = 10.0
+    QUERY_MIN_INTERVAL = 1.0
+    POSITION_RETRY_SECONDS = 2.0
     POSITION_QUERY_TIMEOUT = 10.0  # 超过界面等待窗口后允许重新查询，旧请求仍按 reqid 隔离。
 
     def __init__(self, gateway, *, journal_path: Path | None = None) -> None:
@@ -133,6 +139,13 @@ class SpreadCtpTdApi(CtpTdApi):
         self.preflight = Preflight(ttl_seconds=15)
         self.query_collector = QueryCollector()
         # 只有活动逐笔轮次独享这些 reqid，绝不能把背景轮询当成本轮答复。
+        self._last_query_at = self._last_regular_query_at = float('-inf')
+        self._last_account_poll = float('-inf')
+        self._last_position_poll = float('-inf')
+        self._position_refresh_needed = False
+        self._account_query_reqid: int | None = None
+        self._account_query_started_at = 0.0
+        self.account_cache_token = object()
         self._flight_request: tuple[str, int] | None = None
         self._flight_reqids: set[int] = set()  # 迟到的逐笔请求回包不能进入普通 OMS 轮询
         self.journal_path = journal_path
@@ -240,9 +253,17 @@ class SpreadCtpTdApi(CtpTdApi):
         self._position_query_raw_rows = []
         self.positions.clear()
 
+    def _reset_polling(self) -> None:
+        self._last_account_poll = self._last_position_poll = float('-inf')
+        self._position_refresh_needed = False
+        self._account_query_reqid = None
+        self.account_cache_token = object()
+        self.position_view_at = 0.0
+
     @_serialized_send_state
     def onFrontDisconnected(self, reason: int) -> None:
         self.preflight.invalidate()
+        self._reset_polling()
         self._abort_position_query()
         self._abort_orders_snapshot()
         self._position_activity_generation += 1
@@ -265,7 +286,8 @@ class SpreadCtpTdApi(CtpTdApi):
     def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         self.preflight.invalidate()
         self._native_combos.clear()
-        # 即便账号名称相同，重连前的持仓/委托快照也不能复用。
+        # 即便账号名称相同，重连前的资金/持仓/委托快照也不能复用。
+        self._reset_polling()
         self._abort_position_query()
         self._abort_orders_snapshot()
         self._position_activity_generation += 1
@@ -333,6 +355,9 @@ class SpreadCtpTdApi(CtpTdApi):
 
     @_serialized_send_state
     def advance_order_check(self):
+        if monotonic() - self._last_regular_query_at < self.QUERY_MIN_INTERVAL:
+            return
+
         def allocate():
             self.reqid += 1
             return self.reqid
@@ -345,7 +370,8 @@ class SpreadCtpTdApi(CtpTdApi):
         methods = {'order':self.reqQryOrder,'trade':self.reqQryTrade,
                    'account':self.reqQryTradingAccount,'position':self.reqQryInvestorPosition}
         try:
-            n = methods[request.kind]({'BrokerID':self.brokerid,'InvestorID':self.userid}, request.reqid)
+            n = self._send_query(methods[request.kind],
+                                 {'BrokerID':self.brokerid,'InvestorID':self.userid}, request.reqid, preflight=True)
             if n:
                 raise RuntimeError(f'柜台返回 {n}')
         except Exception as exc:
@@ -408,12 +434,85 @@ class SpreadCtpTdApi(CtpTdApi):
             raise ValueError('意图和门禁配置不匹配')
         return self.preflight.seal(evidence)
 
+    def _send_query(self, send, payload, reqid, *, preflight=False):
+        self._last_query_at = monotonic()
+        if not preflight:
+            self._last_regular_query_at = self._last_query_at
+        return send(payload, reqid)
+
+    @_serialized_send_state
+    def poll_queries(self) -> None:
+        """一拍最多发一项；逐笔核验优先，成交只标记待刷新，不在回报线程查仓。"""
+        if self.query_collector.active:
+            self.advance_order_check()
+            return
+        now = monotonic()
+        if not (self.login_status and self.contract_inited and self.cabinet_trading_day):
+            return
+        if now - self._last_query_at < self.QUERY_MIN_INTERVAL:
+            return
+        if self.position_query_pending:
+            return
+        if self.orders_query_pending:
+            if now - self._orders_query_started_at < self.POSITION_QUERY_TIMEOUT:
+                return
+            self._abort_orders_snapshot()
+        if self._trades_query_reqid is not None:
+            if now - self._trades_query_started_at < self.POSITION_QUERY_TIMEOUT:
+                return
+            self._trades_query_reqid = None
+        if self._account_query_reqid is not None:
+            if now - self._account_query_started_at < self.POSITION_QUERY_TIMEOUT:
+                return
+            self._account_query_reqid = None
+
+        account_age = now - self._last_account_poll
+        position_age = now - self._last_position_poll
+        urgent = self._position_refresh_needed and position_age >= self.POSITION_RETRY_SECONDS
+        # 真正的成交优先，但持续成交时也不能让资金轮询一直饿死。
+        if account_age >= self.ACCOUNT_POLL_SECONDS and (not urgent or
+                account_age >= self.ACCOUNT_POLL_SECONDS + self.POSITION_RETRY_SECONDS):
+            self.query_account()
+        elif urgent or position_age >= self.POSITION_POLL_SECONDS:
+            self._last_position_poll = now  # 按尝试限频；成交标记只在完整回报后清除
+            try:
+                self.query_position(mode='auto')
+            except PositionQueryError:
+                pass  # 柜台限频/繁忙不覆盖上一份完整快照
+            except RuntimeError as exc:
+                self.gateway.write_log(f'后台查询持仓失败：{exc}')
+
+    @_serialized_send_state
+    def query_account(self) -> None:
+        if not self.login_status or not self.cabinet_trading_day or self.query_collector.active:
+            return
+        now = monotonic()
+        if self._account_query_reqid is not None and now - self._account_query_started_at < self.POSITION_QUERY_TIMEOUT:
+            return
+        self._last_account_poll = self._account_query_started_at = now
+        self.reqid += 1
+        self._account_query_reqid = self.reqid
+        try:
+            result = self._send_query(self.reqQryTradingAccount, {}, self.reqid)
+        except Exception as exc:
+            self._account_query_reqid = None
+            self.gateway.write_log(f'查询资金失败：{exc}')
+            return
+        if result:
+            self._account_query_reqid = None
+            self.gateway.write_log(f'查询资金失败：{CTP_RESULT_HINTS.get(result, result)}')
+
     @_serialized_send_state
     def onRspQryTradingAccount(self, data, error, reqid, last):
         if self._receive_order_check('account', data, error, reqid, last):
             return
+        if reqid != self._account_query_reqid:
+            return
+        failed = bool((error or {}).get('ErrorID'))
+        if last or failed:
+            self._account_query_reqid = None
         # 父类只映射 balance/frozen/available；总表要看的保证金与盈亏在这里补上。
-        if not data or "AccountID" not in data:
+        if failed or not data or data.get('AccountID') != self.userid:
             return
         account = AccountData(
             accountid=data["AccountID"],
@@ -426,16 +525,26 @@ class SpreadCtpTdApi(CtpTdApi):
         account.curr_margin = data.get("CurrMargin")
         account.close_profit = data.get("CloseProfit")
         account.position_profit = data.get("PositionProfit")
+        if (all(type(value) in (int, float) and isfinite(value) and abs(value) < float_info.max
+                for value in (data.get('Balance'), data.get('Available')))
+                and data.get('CurrencyID') in (None, '', 'CNY')
+                and data.get('TradingDay', self.cabinet_trading_day.replace('-', ''))
+                == self.cabinet_trading_day.replace('-', '')):
+            account.ctp_cache_token = self.account_cache_token
+            account.ctp_observed_at = self._account_query_started_at
         self.gateway.on_account(account)
 
     @_serialized_send_state
     def onRspError(self, error: dict, reqid: int, last: bool) -> None:
         if self._flight_request and self._flight_request[1] == reqid:
             self.query_collector.abort(f'柜台逐笔查询错误：{error}')
+        if reqid == self._account_query_reqid:
+            self._account_query_reqid = None
         if self.position_query_pending and reqid == self._position_query_reqid:
-            self._abort_position_query()
+            self._abort_position_query(keep_snapshot=self._position_query_mode == 'auto')
         self.gateway.write_error("交易接口报错", error)
 
+    @_serialized_send_state
     def query_position(self, mode: str = "manual") -> None:
         """发起持仓查询。
 
@@ -470,7 +579,7 @@ class SpreadCtpTdApi(CtpTdApi):
         # 父类不检查 CTP 的发送返回码；请求被拒时不能无限等末条回报。
         try:
             self.reqid += 1
-            result = self.reqQryInvestorPosition(
+            result = self._send_query(self.reqQryInvestorPosition,
                 {"BrokerID": self.brokerid, "InvestorID": self.userid}, self.reqid
             )
         except Exception:
@@ -480,6 +589,7 @@ class SpreadCtpTdApi(CtpTdApi):
             self._abort_position_query(keep_snapshot=(mode == "auto"))
             raise PositionQueryError(result)
 
+    @_serialized_send_state
     def query_orders(self) -> None:
         """查询当日委托（CTP ``ReqQryOrder``）；返回的终态才是权威状态。"""
         if self.orders_query_pending:
@@ -498,7 +608,7 @@ class SpreadCtpTdApi(CtpTdApi):
         self._orders_query_reqid = self.reqid
         self._orders_query_started_at = monotonic()
         try:
-            result = self.reqQryOrder(
+            result = self._send_query(self.reqQryOrder,
                 {"BrokerID": self.brokerid, "InvestorID": self.userid}, self.reqid
             )
             if result:
@@ -650,7 +760,7 @@ class SpreadCtpTdApi(CtpTdApi):
         if not self.position_query_pending or reqid != self._position_query_reqid:
             return
         if error and error.get("ErrorID"):
-            self._abort_position_query()
+            self._abort_position_query(keep_snapshot=self._position_query_mode == 'auto')
             return
         if data:
             symbol = str(data.get("InstrumentID", ""))
@@ -680,7 +790,7 @@ class SpreadCtpTdApi(CtpTdApi):
         complete = (not self._position_query_failed and self.contract_inited
                     and self._query_activity_generation == self._position_activity_generation)
         if not complete:
-            self._abort_position_query()
+            self._abort_position_query(keep_snapshot=self._position_query_mode == 'auto')
             return
         # 只在整次快照通过门禁后重放基类逻辑；空回报绝不推送遗留累加器。
         self.positions.clear()
@@ -690,10 +800,10 @@ class SpreadCtpTdApi(CtpTdApi):
                     row, {}, reqid, index == len(self._position_query_raw_rows) - 1
                 )
         except Exception:
-            self._abort_position_query()
+            self._abort_position_query(keep_snapshot=self._position_query_mode == 'auto')
             raise
         if self._query_activity_generation != self._position_activity_generation:
-            self._abort_position_query()
+            self._abort_position_query(keep_snapshot=self._position_query_mode == 'auto')
             return
         if not self._position_query_raw_rows:
             # 完整空仓快照：父类不会发空仓事件；清空仍留在网关的累计值。
@@ -710,6 +820,8 @@ class SpreadCtpTdApi(CtpTdApi):
         self.position_view_sides = {symbol: dict(sides) for symbol, sides in self._position_query_sides.items()}
         self.position_view_account = (self.brokerid, self.userid)
         self.position_view_at = monotonic()
+        self._last_position_poll = self.position_view_at
+        self._position_refresh_needed = False
         self.position_query_pending = False
         self._position_query_reqid = None
         self._position_query_started_at = 0.0
@@ -882,6 +994,7 @@ class SpreadCtpTdApi(CtpTdApi):
             ), data)
         self.gateway.write_error("交易委托失败", error)
 
+    @_serialized_send_state
     def query_trades(self) -> None:
         """显式拉取当日成交明细；不把成功发送查询视作已完整对账。"""
         if (self._trades_query_reqid is not None and
@@ -891,7 +1004,8 @@ class SpreadCtpTdApi(CtpTdApi):
         self._trades_query_reqid = self.reqid
         self._trades_query_started_at = monotonic()
         try:
-            result = self.reqQryTrade({'BrokerID': self.brokerid, 'InvestorID': self.userid}, self.reqid)
+            result = self._send_query(self.reqQryTrade,
+                                      {'BrokerID': self.brokerid, 'InvestorID': self.userid}, self.reqid)
             if result:
                 raise RuntimeError(f'柜台拒绝成交查询：{result}')
         except Exception:
@@ -991,6 +1105,7 @@ class SpreadCtpTdApi(CtpTdApi):
                 self.gateway.write_log(self.reconciliation_event_error)
             return
         self._seen_trades[key] = details
+        self._position_refresh_needed = True
         self.live_seen_orderids.add(trade.vt_orderid)
         self.gateway.on_trade(trade)
 
@@ -1001,6 +1116,7 @@ class SpreadCtpTdApi(CtpTdApi):
                 offset_flag_width: int = 1) -> None:
         self.preflight.invalidate()
         self.cabinet_trading_day = ''  # 须由这次登录重新建立会话上下文
+        self._reset_polling()
         # 不在导入/构造时触碰用户库。真正启动交易通道前先打开流水并恢复冲突门禁；
         # 存储坏了仍允许连接查单/撤单，绝不降级到可发新单的内存模式。
         try:
@@ -1167,22 +1283,11 @@ class SpreadCtpGateway(CtpGateway):
         self.td_api: SpreadCtpTdApi = SpreadCtpTdApi(self, journal_path=journal_path)
 
     def init_query(self) -> None:
-        """定时刷新资金与持仓；持仓查询走 auto 模式，不干扰人工核对快照。"""
-        self.query_functions = [self.query_account, self._auto_query_position]
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
     def process_timer_event(self, event) -> None:
-        if self.td_api.query_collector.active:
-            self.td_api.advance_order_check()
-            return
-        super().process_timer_event(event)
-
-    def _auto_query_position(self) -> None:
-        """后台刷新 OMS 持仓，让持仓面板能跟随成交变化。"""
-        try:
-            self.td_api.query_position(mode="auto")
-        except Exception:
-            pass  # 后台刷新失败不影响交易；人工核对会给出明确错误
+        self.md_api.update_date()
+        self.td_api.poll_queries()
 
     def connect(self, setting: dict) -> None:
         userid: str = setting["用户名"]

@@ -1,15 +1,22 @@
-"""Read-only projection of the current terminal. No network or journal access."""
+"""Read-only projection of the terminal, with optional offline layer/PnL data."""
 from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
 from math import isfinite
 from time import monotonic
+from types import SimpleNamespace
+
+from utils.calendar import trading_day_str
 
 UNKNOWN = '未知'
 MAX_AGE = 300  # Same five-minute window as the reconciliation console.
-# 视图快照由后台持仓查询（约 4 秒一次）刷新，只需比它宽松一点的时效。
-VIEW_MAX_AGE = 15
+# 平时约 10 秒刷新一次，给逐笔核验和请求排队留出余量。
+VIEW_MAX_AGE = 20
+
+
+class OverviewCacheBusy(RuntimeError):
+    """A writer is publishing; this is not an unavailable or disconnected cabinet."""
 
 
 def _number(value):
@@ -387,18 +394,32 @@ def _strategy_row(strategy, active, certain, combo, flat, algo_map, cfg):
     return summary, '顶层止盈未知', opening, 2, '未取得完整委托证据', detail
 
 
-def overview_view(configs: dict, main_engine=None, spread_engine=None) -> dict:
+def _local_layers(rows):
+    layers = []
+    for row in rows if isinstance(rows, list) else ():
+        if not isinstance(row, dict) or row.get('state') == 'CLOSED':
+            continue
+        index, volume, direction = (row.get(k) for k in ('layer_index', 'volume', 'direction'))
+        if type(index) is not int or index < 1 or _number(volume) is None or volume <= 0:
+            continue
+        if type(direction) is not int or direction not in (-1, 1):
+            continue
+        layers.append(SimpleNamespace(**row))
+    return layers
+
+
+def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_local=None) -> dict:
     """Build display strings; priority 0 is most urgent. Config never grants permission."""
     view = dict.fromkeys(('account', 'day', 'connection', 'balance', 'available', 'margin', 'realized', 'unrealized'), UNKNOWN)
     gateway, gw = _gateway(main_engine)
     td = getattr(gw, 'td_api', None)
-    now = monotonic()
     lock = getattr(td, '_send_lock', None)
-    acquired = lock is not None and lock.acquire(blocking=False)
+    if lock is not None and not lock.acquire(blocking=False):
+        raise OverviewCacheBusy('网关缓存正在更新')
     try:
-        scope, login, sides, complete, confirmed, orders = _cabinet(td if lock is None or acquired else None, now)
+        scope, login, sides, complete, confirmed, orders = _cabinet(td, monotonic())
     finally:
-        if acquired:
+        if lock is not None:
             lock.release()
     view.update(source='仅配置' if main_engine is None and spread_engine is None else
                 ('纸面柜台（模拟）' if gateway == 'PAPER' else f'{gateway} 终端缓存' if gateway else '本地引擎缓存'),
@@ -421,6 +442,14 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None) -> dict:
             for key, field in [('balance', 'balance'), ('available', 'available'), ('margin', 'curr_margin'),
                                ('realized', 'close_profit'), ('unrealized', 'position_profit')]:
                 view[key] = _money(getattr(a, field, None))
+    offline = not scope and login is not True and read_local is not None
+    layer_book, pnl_book = read_local() if offline else ({}, {})
+    local_day = trading_day_str(datetime.now()) if offline else ''
+    if offline:
+        view['source'] = '本地缓存（未连接柜台）'
+        view['connection'] = '交易端未登录'
+        for key in ('balance', 'available', 'margin', 'realized', 'unrealized'):
+            view[key] = '未连接柜台'
     strategies = getattr(getattr(spread_engine, 'strategy_engine', None), 'strategies', {}).copy()
     strategy_by_name: dict[str, object] = {}
     for name in configs:
@@ -428,7 +457,7 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None) -> dict:
                       (not getattr(s, 'spread_name', None) and k == f'CrossPeriodMRStrategy_{name}')]
         if len(candidates) == 1:
             strategy_by_name[name] = candidates[0]
-    view['permission'] = _permission_text(strategy_by_name)
+    view['permission'] = '只读 · 离线' if offline else _permission_text(strategy_by_name)
     leg_counts = Counter(s for cfg in configs.values() for s in cfg.get('legs', ()))
     for name, cfg in configs.items():
         legs = tuple(cfg.get('legs', ()))
@@ -460,14 +489,35 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None) -> dict:
             status, priority = '开仓未决', 1
         leg_label = (f'近 {legs[0]} / 远 {legs[1]} · 仓位未知'
                      if len(legs) == 2 and leg_text == UNKNOWN else leg_text)
-        order_text += '\n仅列活动委托，不含成交明细'
+        prices = _layer_legs(strategy, legs)
+        live_price = _live_spread(spread)
+        target = _take_profit_spread(strategy)
+        add = _add_spread(strategy, active)
+        total = getattr(strategy, 'total_realized', None)
+        today = getattr(strategy, 'daily_realized', None)
+        if offline:
+            cached_layers = _local_layers(layer_book.get(name)) if name in layer_book else local
+            display_book = SimpleNamespace(layers=cached_layers)
+            known_empty = layer_book.get(name) == []
+            layers = f'本地 {len(cached_layers)} 层' if cached_layers or known_empty else UNKNOWN
+            prices = _layer_legs(display_book, legs) if cached_layers else UNKNOWN
+            target = _take_profit_spread(display_book)
+            live_price = add = UNKNOWN
+            opening, protection, priority = '离线', '柜台未核实', 2
+            status = '本地层账 · 待核对' if cached_layers else '离线 · 待核对'
+            entry = pnl_book.get(name)
+            total = entry.get('total') if isinstance(entry, dict) else None
+            today = entry.get('today') if isinstance(entry, dict) and entry.get('day') == local_day else None
+            detail = '\n'.join(('配置腿：' + ' / '.join(legs), '柜台持仓未核实；以下为本地记录。',
+                               *(_layer_legs(SimpleNamespace(layers=[layer]), legs)
+                                 for layer in sorted(cached_layers, key=lambda x: x.layer_index, reverse=True))))
+            order_text = '未连接柜台，无法确认当前活动委托。'
+        else:
+            order_text += '\n仅列活动委托，不含成交明细'
         view['rows'].append(dict(name=name, display=_display_name(cfg, name), held=held, layers=layers,
-                                 legs=_layer_legs(strategy, legs),
-                                 live=_live_spread(spread), take_profit=_take_profit_spread(strategy),
-                                 add=_add_spread(strategy, active),
+                                 legs=prices, live=live_price, take_profit=target, add=add,
                                  log=_latest_log(strategy),
-                                 total=_pnl_text(getattr(strategy, 'total_realized', None)),
-                                 today=_pnl_text(getattr(strategy, 'daily_realized', None)),
+                                 total=_pnl_text(total), today=_pnl_text(today),
                                  cabinet=leg_label, protection=protection, opening=opening,
                                  priority=priority, status=status,
                                  detail=detail, orders=order_text))

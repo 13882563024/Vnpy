@@ -15,10 +15,13 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from math import isfinite
+from time import monotonic
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RISK_PATH = PROJECT_ROOT / "config" / "risk.json"
 DEFAULT_MAX_MARGIN_RATIO = 0.70
+CTP_ACCOUNT_MAX_AGE = 30.0
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,8 @@ def save_risk_limits(limits: RiskLimits, path: Path | str | None = None) -> None
                 pass
 
 
-def account_usage(main_engine, gateway_name: str = "CTP") -> AccountUsage | None:
+def account_usage(main_engine, gateway_name: str = "CTP", *,
+                  require_fresh: bool = False) -> AccountUsage | None:
     """汇总该网关的权益/可用资金与已用比例；没有账户数据返回 None。"""
     getter = getattr(main_engine, "get_all_accounts", None)
     if not callable(getter):
@@ -94,11 +98,24 @@ def account_usage(main_engine, gateway_name: str = "CTP") -> AccountUsage | None
         ]
     except Exception:
         return None
+    if require_fresh:
+        gateways = getattr(main_engine, 'gateways', {})
+        td = getattr(gateways.get(gateway_name), 'td_api', None)
+        token = getattr(td, 'account_cache_token', None)
+        if token is not None:
+            now = monotonic()
+            accounts = [item for item in accounts
+                        if getattr(td, 'login_status', False)
+                        and getattr(item, 'accountid', None) == td.userid
+                        and getattr(item, 'ctp_cache_token', None) is token
+                        and 0 <= now - getattr(item, 'ctp_observed_at', float('-inf')) < CTP_ACCOUNT_MAX_AGE]
     if not accounts:
         return None
 
     balance = sum(float(getattr(item, "balance", 0) or 0) for item in accounts)
     available = sum(float(getattr(item, "available", 0) or 0) for item in accounts)
+    if not (isfinite(balance) and isfinite(available)):
+        return None
     if balance <= 0:
         return AccountUsage(balance=balance, available=available, ratio=1.0)
     used = max(0.0, balance - available)

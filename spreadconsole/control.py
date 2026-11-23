@@ -960,7 +960,7 @@ class SpreadTradingControl:
     def _cabinet_covers(self, name: str, direction: int, volume: float) -> bool:
         """柜台持仓是否覆盖“平掉 volume 手方向为 direction 的价差”。
 
-        以 OMS 持仓（后台每 ~4 秒刷新）为准；查不到/方向不符就返回 False，
+        以 OMS 持仓（成交后优先刷新，平时约 10 秒一次）为准；查不到/方向不符就返回 False，
         宁可不挂平仓单，也不发出会被“平仓量超过持仓量”拒绝的委托。
 
         **必须扣掉在途平仓委托**：CTP 的可用平仓量 = 持仓 − 已挂平仓未成交量。
@@ -1595,8 +1595,6 @@ class SpreadTradingControl:
         因为柜台事实没有改变，改的只是本机记录。在途委托只提醒，``force=True``
         时照常同步——委托正是需要纠正的常见原因。
         """
-        if self.master_running:
-            raise ManagedSpreadError("请先停止总交易，再纠正本地持仓")
         config = self.service.get(name)
         spread = self.spread_engine.get_spread(name)
         strategy = self._strategy(name)
@@ -1610,6 +1608,8 @@ class SpreadTradingControl:
         problem = self._snapshot_problem(td)
         if problem:
             raise ManagedSpreadError(f"柜台持仓快照不可用：{problem}；请点“核对柜台状态”重新查询")
+        snapshot_generation = getattr(td, 'position_query_generation', None)
+        snapshot_at = getattr(td, 'position_snapshot_at', None)
         snapshot = td.position_snapshot_sides
         cabinet: dict[str, dict[str, float]] = {}
         for symbol in config.legs:
@@ -1645,6 +1645,40 @@ class SpreadTradingControl:
                 f"柜台两腿仓位不匹配（{near} 多{near_long:g}/空{near_short:g}，"
                 f"{far} 多{far_long:g}/空{far_short:g}），自动纠正会算错对价，禁止执行；请人工处理"
             )
+
+        # 只暂停目标策略；已经一致且无待核状态的运行合约不打断。
+        deadline = self.armed.get(name)
+        was_live = self.master_running and getattr(strategy, 'live_trading', False)
+        running = self.master_running and (was_live or deadline is not None
+                                           or not getattr(strategy, 'paused', False))
+        if running:
+            order_problem = self._orders_snapshot_problem(td)
+            if order_problem:
+                raise ManagedSpreadError(order_problem)
+            state = strategy.get_pause_state()
+            leg_pos = getattr(spread, 'leg_pos', {})
+            consistent = all(abs(float(leg_pos.get(symbol, 0)) - target[symbol]) < 1e-9
+                             for symbol in config.legs)
+            if consistent and ((flat and not strategy.layers and not state.get('trades_by_order'))
+                               or (not flat and self._layers_match_net(spread, strategy)
+                                   and self._layers_well_formed(spread, strategy))):
+                raise ManagedSpreadError('本地账已与柜台一致，无须重复纠正；保持当前交易状态')
+            # 不为一次纠正打断仍在处理委托/成交明细的真实算法；保留原策略的保护与回报路由。
+            algos = getattr(getattr(self.spread_engine, 'algo_engine', None), 'algos', {}) or {}
+            for algoid in state.get('active_algoids', ()):
+                if str(algoid).startswith('recovered_'):
+                    continue
+                algo = algos.get(algoid)
+                if algo is None or not callable(getattr(algo, 'is_order_finished', None)) or not algo.is_order_finished():
+                    raise ManagedSpreadError('算法仍在途或状态未知，未暂停策略；待柜台委托及成交结束后再核对纠正')
+            self.armed.pop(name, None)  # 防止预启动看门狗在纠正期间放行
+            strategy.live_trading = False
+            try:
+                strategy.pause_strategy()
+            except Exception as exc:
+                raise ManagedSpreadError(f'{name} 暂停失败，已关闭该合约发单许可：{exc}') from exc
+            if not strategy.paused:
+                raise ManagedSpreadError(f'{name} 未能暂停，已关闭该合约发单许可，未执行纠正')
 
         symbols = set(config.legs + [config.exchange_spread_vt_symbol])
         # 权威依据：柜台当日委托快照。柜台没有的 = 上一交易日（已随结算失效）或已终结，
@@ -1716,7 +1750,7 @@ class SpreadTradingControl:
             if flat and not settled_layers and not settled_trades and not algoids:
                 raise ManagedSpreadError("本地账已与柜台一致，无须重复纠正；可直接开启交易")
         # 不先清历史层账：保存失败时仍须保留原来的全部策略状态。
-        # 交易许可意图保持不变（总开关仍关闭、策略仍暂停），少一次重复点击。
+        # 不改变总开关；目标合约仍暂停，写入之后才考虑恢复。
         # 持仓可能在对话框确认期间变化：写入前再次核对同一份快照及委托状态。
         if (self._snapshot_problem(td)
                 or any(float(spread.leg_pos[symbol]) != float(old[symbol]) for symbol in config.legs)
@@ -1725,6 +1759,8 @@ class SpreadTradingControl:
                 or strategy.get_pause_state().get("trades_by_order", {}) != state.get("trades_by_order", {})
                 or strategy.get_pause_state().get("orders", {}) != state.get("orders", {})
                 or strategy.get_pause_state().get("active_algoids", []) != state.get("active_algoids", [])
+                or getattr(td, 'position_query_generation', None) != snapshot_generation
+                or getattr(td, 'position_snapshot_at', None) != snapshot_at
                 or getattr(td, "position_snapshot_sides", None) != snapshot
                 or {getattr(order, "vt_orderid", "")
                     for order in self.main_engine.get_all_active_orders()
@@ -1787,6 +1823,9 @@ class SpreadTradingControl:
             except Exception as exc:
                 self.errors[name] = f"持仓已保存，但策略层账刷新失败：{exc}；请重新核对"
                 raise ManagedSpreadError(self.errors[name]) from exc
+        save_layers = getattr(strategy, "_save_layers", None)
+        if callable(save_layers):
+            save_layers()
         for algoid in algoids:
             algos[algoid].status = Status.CANCELLED
             strategy.algoids.discard(algoid)
@@ -1820,7 +1859,8 @@ class SpreadTradingControl:
             message += f"；按柜台削减了 {trimmed_total:g} 手（不产生盈亏，已归档被削的层）"
         if callable(writer):
             try:
-                writer(message)
+                if not running:
+                    writer(message)
                 if blockers and force:
                     writer(
                         f"警告：{name} 是在仍有「{'、'.join(blockers)}」时强制同步本地持仓的；"
@@ -1830,6 +1870,36 @@ class SpreadTradingControl:
                 pass  # 日志写入失败不能把已经完成的持仓修正伪装成失败。
         # 同步后刷新“上次会话遗留委托”，重启后仍能提示。
         self._remember_orders()
+        if running:
+            message = message.replace('核对状态保留，可直接开启交易', '本地账已保存')
+            try:
+                if not self.master_running or name not in self.enabled or not (was_live or deadline is not None):
+                    raise ManagedSpreadError('该合约未获交易许可')
+                config = self.validate(name)
+                if was_live:
+                    problem = self.quote_problem(config)
+                    if problem:
+                        raise ManagedSpreadError(problem)
+                elif deadline <= monotonic():
+                    raise ManagedSpreadError('预启动已超时')
+                if not strategy.resume_strategy(reconciled=True):
+                    raise ManagedSpreadError('暂停期间订单未核对，禁止恢复')
+                self.validate(name)
+                if was_live:
+                    strategy.live_trading = True
+                    message += '；该合约已恢复交易'
+                else:
+                    self.armed[name] = deadline
+                    message += '；该合约继续等待开盘报价'
+            except Exception as exc:
+                strategy.live_trading = False
+                strategy.pause_strategy()
+                message += f'；该合约保持暂停：{exc}'
+            if callable(writer):
+                try:
+                    writer(message)
+                except Exception:
+                    pass
         return message
 
     def sync_all(self, *, force: bool = True) -> list[tuple[str, str, str]]:
@@ -1837,8 +1907,6 @@ class SpreadTradingControl:
 
         结果取值：``ok`` 已同步、``skip`` 本来就一致、``fail`` 无法自动处理。
         """
-        if self.master_running:
-            raise ManagedSpreadError("请先停止总交易，再批量纠正本地持仓")
         results: list[tuple[str, str, str]] = []
         for name in sorted(self.service.list()):
             try:
@@ -2118,7 +2186,8 @@ class SpreadTradingControl:
         ):
             raise ManagedSpreadError("旧算法或委托仍在途；请在柜台人工处置后再核对恢复")
         if strategy.layers or state["spread_net_pos_now"] or state["spread_net_pos_at_pause"]:
-            if not self._adopted_layers_ok(name, spread, strategy):
+            if not (self._adopted_layers_ok(name, spread, strategy)
+                    or (self._layers_match_net(spread, strategy) and self._layers_well_formed(spread, strategy))):
                 raise ManagedSpreadError(
                     "价差存在旧持仓/策略层账；柜台与策略未完成逐层核对，禁止恢复"
                 )

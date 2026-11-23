@@ -237,6 +237,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self._batch_retry_done = False
         # 自动纠正模式：查询完成后不再弹确认窗口，直接确认核对并批量纠正。
         self._auto_mode = False
+        self._repair_target: str | None = None
         # 用户点了「开始交易」但还没核对完：纠正成功后自动接上启动。
         self._pending_start = False
         self._position_query_attempts = 0
@@ -587,6 +588,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(900, self._show_reconciliation_result)
 
     def _fail_reconciliation(self, title: str, text: str):
+        self._repair_target = None
         self._reconciliation_pending = False
         self._batch_sync = False
         self._pending_start = False
@@ -601,11 +603,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         try:
             report = self.control.reconciliation_report()
         except Exception as exc:
-            self._reconciliation_pending = False
-            self.reconcile.setEnabled(True)
-            self.reconcile.setText("核对柜台状态")
-            QtWidgets.QMessageBox.warning(self, "读取核对结果失败", str(exc))
-            self._refresh()
+            self._fail_reconciliation("读取核对结果失败", str(exc))
             return
 
         # 本地仓位纠正必须等 CTP 持仓查询完整结束（含空持仓回报），不能用旧缓存。
@@ -701,7 +699,8 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             "\n\n核对确认只记录账户状态，不会撤销委托、不会平仓，也不会把对不齐的合约变成可交易。"
             "\n程序只能展示已查询到的状态，请再与主终端的委托/成交记录核对。"
         )
-        if self._auto_mode:
+        repair_target, self._repair_target = self._repair_target, None
+        if self._auto_mode or repair_target:
             # 自动纠正：不再让用户点确认，直接走确认+纠正。
             accepted = True
         else:
@@ -713,7 +712,9 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
                 self.control.confirm_reconciliation()
                 unresolved = [item["name"] for item in report["contracts"]
                               if not self.control.is_reconciled(item["name"])]
-                if self._batch_sync:
+                if repair_target:
+                    self._apply_selected_repair(repair_target)
+                elif self._batch_sync:
                     self._run_batch_sync(unresolved)
                 elif unresolved:
                     self.notice.setText(
@@ -750,6 +751,9 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         summary = f"核对并纠正完成：成功 {len(ok)}，无需处理 {len(skip)}"
         if fails:
             summary += f"，失败 {len(fails)}"
+        paused = [name for name, kind, message in results if kind == "ok" and "该合约保持暂停" in message]
+        if paused:
+            summary += f"；已纠正但保持暂停：{', '.join(paused)}"
         if unresolved:
             summary += f"；缺完整逐腿数据：{', '.join(unresolved)}"
         self.notice.setText(summary)
@@ -797,14 +801,25 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             f"把 {name} 的本地账对齐到本次柜台快照：\n"
             "· 柜台两腿空仓 → 清零本地价差并归档旧层账；\n"
             "· 柜台两腿数量匹配 → 按柜台仓位同步本地价差，并生成接管层（用柜台两腿均价）；\n"
+            "· 柜台少于本地 → 在同方向、两腿匹配时从最高层削减多出的手数，不计入盈亏；\n"
             "· 两腿不匹配或多空不分 → 拒绝，需人工处理。\n\n"
             "若仍有在途委托，会先提醒一次；确认后照样同步（不会撤单或平仓）。"
-            "核对确认状态会保留，同步后可直接开启交易。确认继续？",
+            "总交易开启时，仅暂停需要纠正的合约；核对、盘口与启动检查通过后才恢复。确认继续？",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No,
         )
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+        if self.control.master_running:
+            # 运行期间新回报会作废旧快照；手动点一次就查新快照再纠正该合约。
+            self._repair_target = name
+            self._confirm_reconciliation()
+            if not self._reconciliation_pending:
+                self._repair_target = None
+            return
+        self._apply_selected_repair(name)
+
+    def _apply_selected_repair(self, name: str) -> None:
         try:
             self.notice.setText(self.control.sync_spread_position(name))
         except Exception as exc:

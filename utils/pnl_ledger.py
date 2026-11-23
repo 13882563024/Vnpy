@@ -21,7 +21,8 @@ def _path() -> Path:
     return Path(get_file_path("spread_realized.json"))
 
 
-def _read() -> dict:
+def read_all() -> dict:
+    """读取完整本地文件，供只读界面一次构建所有行。"""
     try:
         raw = json.loads(_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -39,7 +40,7 @@ def _write(data: dict) -> None:
 
 def load(name: str, day: str) -> tuple[float, float]:
     """返回 (累计收益, 当日收益)；不是同一天的旧"当日"按 0 处理。"""
-    row = _read().get(name) or {}
+    row = read_all().get(name) or {}
     try:
         total = float(row.get("total", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -53,7 +54,7 @@ def load(name: str, day: str) -> tuple[float, float]:
 
 def record(name: str, amount: float, day: str) -> tuple[float, float]:
     """记一笔已实现收益，返回台账里的 (累计, 当日)。"""
-    data = _read()
+    data = read_all()
     row = dict(data.get(name) or {})
     try:
         total = float(row.get("total", 0.0) or 0.0) + float(amount)

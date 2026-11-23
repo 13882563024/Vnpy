@@ -153,6 +153,28 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(algo._gate_wait_req)
         self.assertEqual(algo.impl.order_ids, ['CTP.1'])
 
+    def test_take_profit_check_uses_settled_layer_book(self):
+        # Even when a combination fill has not updated SpreadData.leg_pos,
+        # verification compares the fresh cabinet snapshot with the settled layers.
+        algo, engine, td = self._algo({'expected_close_legs': (2, -2)})
+        self.assertFalse(algo.spread.leg_pos)
+        td.query_collector.ready = True
+        algo.on_interval()
+
+        engine.main_engine.send_order.assert_called_once()
+        limits = td.finish_calls[0][1]
+        self.assertEqual((limits.expected_near, limits.expected_far), (2, -2))
+
+    def test_queued_check_failure_releases_algo_slot(self):
+        with patch.object(FakeTd, 'begin_order_check', side_effect=RuntimeError('已有逐笔查询进行中')):
+            algo, engine, td = self._algo()
+        with patch.object(td, 'begin_order_check', side_effect=RuntimeError('会话未确认')):
+            algo.on_interval()
+
+        engine.main_engine.send_order.assert_not_called()
+        self.assertTrue(algo.stopped)
+        self.assertFalse(algo.is_gate_pending())
+
     def test_timeout_is_reported_and_nothing_is_sent(self):
         algo, engine, td = self._algo()
         algo._gate.timeout = 0.0

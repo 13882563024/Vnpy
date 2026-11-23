@@ -339,9 +339,7 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
                 f"{req.volume:g}@{req.price:g} 用途={self.purpose}")
             return
         if '进行中' not in error:
-            self._gate_wait_req = None
-            self._gate_wait_logged = False
-            self.write_log(f"无法开始逐笔核验：{error}")
+            self._gate_failed(error)
 
     def _gate_failed(self, error: str) -> None:
         """核验没通过：记录原因并结束本算法，让策略拿到终态后自己重挂。
@@ -408,6 +406,10 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
             {"purpose": purpose, "tier": tier, "reason": self.reason, "price": float(req.price)},
         )
         legs = getattr(self.spread, "leg_pos", {}) or {}
+        expected_near = legs.get(str(extra["near_vt"]), 0)
+        expected_far = legs.get(str(extra["far_vt"]), 0)
+        if self.purpose == AlgoKind.TAKE_PROFIT and "expected_close_legs" in extra:
+            expected_near, expected_far = extra["expected_close_legs"]
         limits = ScopedLimits(
             strategy=self.spread_name,
             near=str(extra["near"]), far=str(extra["far"]),
@@ -417,8 +419,8 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
             signal_current=True,
             quotes_current=self._quotes_current(extra),
             session_open=self._session_open(str(extra["trading_sessions"])),
-            expected_near=float(legs.get(str(extra["near_vt"]), 0) or 0),
-            expected_far=float(legs.get(str(extra["far_vt"]), 0) or 0),
+            expected_near=float(expected_near or 0),
+            expected_far=float(expected_far or 0),
             known_orders=self._known_orders(extra),
         )
         return intent, limits

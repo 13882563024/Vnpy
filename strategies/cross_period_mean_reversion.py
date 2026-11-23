@@ -450,6 +450,9 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         if self.paused:
             self.write_log("策略暂停期间收到停止回调：不撤现有委托，请人工核对后再恢复")
             return
+        # vn.py 在 on_stop 返回后才清 trading；同步撤单回报不能触发新单。
+        self.trading = False
+        self.pending_open = self.pending_close = None
         self._cancel_all_algos("策略停止")
         self.write_log("策略已停止")
 
@@ -540,9 +543,11 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         return
 
     def on_spread_pos(self) -> None:
-        """价差持仓核对：策略记录的层合计必须与价差净仓一致。"""
+        """持仓刷新后补挂止盈，并核对策略层账与价差净仓。"""
         if not self.layers:
             return
+        # 成交回报可能先于 OMS 持仓刷新；可平量一旦就绪，不必等下一次价差行情。
+        self._maybe_preplace_exit()
         expected = self.direction * sum(layer.volume for layer in self.layers)
         net = self.spread.net_pos
         if abs(net - expected) < 1e-9:
@@ -1434,9 +1439,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         main_engine = getattr(self.strategy_engine, "main_engine", None)
         if main_engine is None:      # 回测/假引擎没有账户资金，不参与实盘风控
             return ""
-        usage = account_usage(main_engine)
+        usage = account_usage(main_engine, require_fresh=True)
         if usage is None:
-            return "无账户资金数据，无法确认已用资金比例"
+            self.last_margin_ratio = None
+            return "无账户资金数据或资金缓存已过期，无法确认已用资金比例"
         self.last_margin_ratio = usage.ratio
         if usage.ratio >= limits.max_margin_ratio:
             return (
@@ -1500,7 +1506,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
                     request.cancel_requested_at = now
                     self.write_log("平仓前先撤在挂单，等撤单确认后再发平仓单")
                 for algoid in algoids:
-                    self.stop_algo(algoid)
+                    self._cancel_for_transition(algoid)
                 if now - request.cancel_requested_at >= 3 and now - request.last_warn_at >= 3:
                     request.last_warn_at = now
                     self.write_log("警告：撤单确认超过 3s 未完成，暂缓平仓（避免仓已平、单还在）")
@@ -1518,12 +1524,18 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
                     request.cancel_requested_at = now
                     self.write_log("加仓前撤掉在挂止盈单")
                 for algoid in algoids:
-                    self.stop_algo(algoid)
+                    self._cancel_for_transition(algoid)
                 return True
             self._dispatch_open(moment)
             return True
 
         return False
+
+    def _cancel_for_transition(self, algoid: str) -> None:
+        job = self.jobs.get(algoid)
+        if job is not None and job.kind == AlgoKind.TAKE_PROFIT:
+            job.cancel_for_transition = True
+        self.stop_algo(algoid)
 
     def _cancel_all_algos(self, reason: str) -> None:
         algoids = self._active_algoids()
@@ -1610,9 +1622,11 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         - 逐层各挂一张会把可平量分摊掉，后挂的必然撞上「平仓量超过持仓量」（错误码 30）；
         - 加仓时状态机要「先撤掉在挂止盈单」，多张单会让撤单/重挂时序变得不可控。
 
-        最新层平掉后由 ``_on_exit_filled`` 回调本方法，自然轮到下一层（LIFO），
+        开平仓算法终态回调会调用本方法，自然轮到新的最高层（LIFO），
         所以每层都有自己的止盈，只是不同时刻只挂一张。
         """
+        if self.paused or self._in_advance:
+            return
         self._decision_moment = moment      # 供 exit_layer 内部的时段校验对齐
         # 预热期间是否挂止盈由 warmup_block_exit 决定（默认不拦：止盈是仓位保护）。
         if getattr(self, "warmup_block_exit", False) and not self._warmup_ready():
@@ -1682,7 +1696,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             target_spread=layer.target_spread,
             reason=f"预挂止盈 第{layer.layer_index}层",
         )
-        self.write_log(f"挂出止盈单 {algoid}：{layer.describe()}")
+        self.write_log(f"启动止盈算法 {algoid}（柜台报单以执行器回报为准）：{layer.describe()}")
         self._log_order_basis(
             "止盈",
             PendingAction(
@@ -1736,16 +1750,20 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             return
 
         status = getattr(algo, "status", None)
-        if status == Status.ALLTRADED:
-            job.done = True
-            self._finish_job(algo, job, filled=True)
-        elif status in (Status.CANCELLED, Status.REJECTED):
-            job.done = True
-            filled = abs(getattr(algo, "traded_volume", 0) or 0) > 0
-            self._finish_job(algo, job, filled=filled)
+        if status not in (Status.ALLTRADED, Status.CANCELLED, Status.REJECTED):
+            return
+        job.done = True
+        filled = status == Status.ALLTRADED or abs(getattr(algo, "traded_volume", 0) or 0) > 0
+        self._finish_job(algo, job, filled=filled)
 
         self._prune_jobs()
-        self._advance_state(self._snapshot.datetime if self._snapshot else None)
+        moment = self._snapshot.datetime if self._snapshot else None
+        self._advance_state(moment)
+        # 先处理待执行的风控/开仓；有剩余仓位且槽位已释放时立即接续止盈。
+        # 非计划终止仍由行情/持仓回调按退避重试，避免在拒单回调里连发。
+        if (job.kind != AlgoKind.TAKE_PROFIT or filled
+                or (job.cancel_for_transition and status == Status.CANCELLED)):
+            self._maybe_preplace_exit(moment)
 
     def _finish_job(self, algo, job: AlgoJob, filled: bool) -> None:
         volume = abs(getattr(algo, "traded_volume", 0) or 0)
@@ -1787,8 +1805,6 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             f"开仓成交 {layer.describe()} 价差{price:g} 成交{volume:g}手"
             f"（腿价 {near_price:g}/{far_price:g}）"
         )
-        # 成交后立即为最新层挂止盈
-        self._maybe_preplace_exit(layer.open_datetime)
 
     def _on_exit_filled(self, algo, job: AlgoJob, volume: float, price: float, filled: bool) -> None:
         layer = self._find_layer(job.tier_id)
@@ -1797,10 +1813,11 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         if layer is None:
             self.write_log("止盈成交但找不到对应层（请人工核对）")
             return
+        layer.algoid = ""
         if volume <= 0 or not filled:
-            # 算法已终止（拒单 / 被动撤单 / 无成交收尾）：柜台此刻没有该层的止盈单，
-            # 必须放开占位，否则本层会永久失去止盈保护。
-            layer.algoid = ""
+            # 主动让出挂单槽位不是止盈失败。若加仓未成或平仓仍有剩余，原层可立即接续。
+            if job.cancel_for_transition and getattr(algo, "status", None) == Status.CANCELLED:
+                return
             layer.retry_count += 1
             if layer.retry_count >= int(self.exit_retry_limit):
                 layer.state = TierState.PENDING_RETRY
@@ -1834,7 +1851,6 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self.write_log(
             f"止盈成交 第{layer.layer_index}层 价差{price:g} 平{closed:g}手 净利{realized:.0f}元"
         )
-        self._maybe_preplace_exit(self._snapshot.datetime if self._snapshot else None)
 
     def _on_close_filled(self, algo, job: AlgoJob, volume: float, price: float, filled: bool) -> None:
         # 从最高层往下扣减：与止盈、止损的层序口径一致。
@@ -1961,6 +1977,10 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             return ""
         extra = self._build_extra(AlgoKind.TAKE_PROFIT, f"预挂止盈 第{layer.layer_index}层",
                                   tier_id=layer.tier_id)
+        # 组合代码成交不一定更新 SpreadData.leg_pos 的两条腿。用刚结算的层账
+        # 提供预期净仓，仍由逐笔查询核对柜台两腿和冻结量。
+        layer_net = self.local_layer_net()
+        extra["expected_close_legs"] = (layer_net, -layer_net)
         if layer.direction > 0:
             return self.start_short_algo(layer.target_spread, layer.volume,
                                          int(self.payup), 0, False, extra)

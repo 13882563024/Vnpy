@@ -13,19 +13,99 @@ from gateway.ctp_spread_gateway import PositionQueryError, SpreadCtpTdApi, Sprea
 
 
 class PeriodicQueryTests(unittest.TestCase):
-    def test_periodic_query_refreshes_positions_in_auto_mode(self):
+    def setUp(self):
         from vnpy.event import EventEngine
-        events = EventEngine()
-        gateway = SpreadCtpGateway(events, "CTP")
-        gateway.init_query()
-        self.assertEqual(
-            gateway.query_functions, [gateway.query_account, gateway._auto_query_position])
-        gateway.td_api.position_snapshot_at = 123.0
-        with patch.object(gateway.td_api, "query_position") as query:
-            gateway._auto_query_position()
-            query.assert_called_once_with(mode="auto")
-        # 后台刷新不能作废人工核对快照
-        self.assertEqual(gateway.td_api.position_snapshot_at, 123.0)
+        self.gateway = SpreadCtpGateway(EventEngine(), "CTP")
+        self.api = self.gateway.td_api
+        self.api.login_status = self.api.contract_inited = True
+        self.api.cabinet_trading_day = '2026-11-19'
+        self.now = 100.0
+        clock = patch('gateway.ctp_spread_gateway.monotonic', side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.account = Mock(return_value=0)
+        self.position = Mock(return_value=0)
+        for name, mock in [('reqQryTradingAccount', self.account), ('reqQryInvestorPosition', self.position)]:
+            stub = patch.object(self.api, name, mock)
+            stub.start()
+            self.addCleanup(stub.stop)
+        contracts = patch.dict(symbol_contract_map, {'a2701': object()})
+        contracts.start()
+        self.addCleanup(contracts.stop)
+
+    def tick(self, seconds=0):
+        self.now += seconds
+        self.gateway.process_timer_event(None)
+
+    def complete_account(self):
+        self.api.onRspQryTradingAccount({}, {}, self.api._account_query_reqid, True)
+
+    def complete_position(self):
+        self.api.onRspQryInvestorPosition({}, {}, self.api._position_query_reqid, True)
+
+    def test_account_and_position_have_different_periods(self):
+        self.api.position_snapshot_at = 123.0
+        self.tick()
+        self.account.assert_called_once()
+        self.position.assert_not_called()
+        self.complete_account()
+        self.tick()
+        self.position.assert_not_called()  # shared request spacing
+        self.tick(1)
+        self.position.assert_called_once()
+        self.assertEqual(self.api._position_query_mode, 'auto')
+        self.complete_position()
+        self.assertEqual(self.api.position_snapshot_at, 123.0)
+        self.tick(9)
+        self.position.assert_called_once()
+        self.tick(1)
+        self.assertEqual(self.position.call_count, 2)
+        self.complete_position()
+        self.tick(3)
+        self.account.assert_called_once()
+        self.tick(1)
+        self.assertEqual(self.account.call_count, 2)
+
+    def test_trade_refresh_coalesces_and_retries_a_stale_response(self):
+        self.api._last_account_poll = self.api._last_position_poll = self.now
+        for tradeid in ('T1', 'T2'):
+            self._trade(tradeid)
+        self.tick(1)
+        self.position.assert_not_called()
+        self.tick(1)
+        self.position.assert_called_once()
+        # Another fill in flight invalidates that response; the refresh is not lost.
+        self._trade('T3')
+        self.complete_position()
+        self.assertTrue(self.api._position_refresh_needed)
+        self.tick(2)
+        self.assertEqual(self.position.call_count, 2)
+        self.complete_position()
+        self.assertFalse(self.api._position_refresh_needed)
+        self._trade('T3')  # replay of an existing execution does not request another refresh
+        self.tick(2)
+        self.assertEqual(self.position.call_count, 2)
+
+    def _trade(self, tradeid):
+        data = dict(InstrumentID='a2701', FrontID=1, SessionID=2, OrderRef='3',
+                    Direction='0', OffsetFlag='0', TradeDate='20261119', TradeTime='10:00:00',
+                    TradeID=tradeid, Price=4200, Volume=1)
+        with patch.object(self.api, 'ensure_contract', return_value=SimpleNamespace(exchange=Exchange.DCE)):
+            self.api.onRtnTrade(data)
+
+    def test_preflight_takes_priority_over_background_refresh(self):
+        with patch.object(self.api, 'query_collector', SimpleNamespace(active=True)), \
+                patch.object(self.api, 'advance_order_check') as advance:
+            self.tick()
+            advance.assert_called_once()
+        self.account.assert_not_called()
+        self.position.assert_not_called()
+
+    def test_does_not_poll_disconnected_gateway(self):
+        self.api.login_status = False
+        self.tick()
+        self.account.assert_not_called()
+        self.position.assert_not_called()
 
 
 class SpreadOrderReportTests(unittest.TestCase):
@@ -143,6 +223,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_account_query_maps_margin_and_profit(self):
         """总表要的占用保证金/已实现/未实现，父类没映射，必须在这里补。"""
+        self.api._account_query_reqid = 1
         self.api.onRspQryTradingAccount({
             "AccountID": "account", "Balance": 300000.0, "Available": 240000.0,
             "FrozenMargin": 1.0, "FrozenCash": 2.0, "FrozenCommission": 3.0,
@@ -155,6 +236,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(account.position_profit, -300.0)
         self.assertEqual(account.frozen, 6.0)
         self.assertEqual(account.available, 240000.0)
+        self.assertIs(account.ctp_cache_token, self.api.account_cache_token)
 
     def test_contract_dir_late_reports_are_replayed_not_frozen(self):
         """登录时先到的委托回报只缓存；目录就绪后重放，并且不再永久冻结核对。
