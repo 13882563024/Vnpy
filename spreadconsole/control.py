@@ -12,9 +12,6 @@ from utils.spread_config import SpreadConfig
 # 交易关闭期间柜台仓位只可能被人工改动；给足阅读/确认时间，真正的时效由
 # “快照之后是否又收到委托/成交回报”保证，而不是一个很短的秒数。
 SNAPSHOT_MAX_AGE = 300.0
-# 预启动（盘前挂好、开盘自动放行）的最长等待时间。
-# 与快照有效期取同一个值：超过 5 分钟，核对依据本身已经过期，必须重新核对。
-ARM_MAX_WAIT = 300.0
 
 
 class SpreadTradingControl:
@@ -50,9 +47,10 @@ class SpreadTradingControl:
         self._reconciliation_snapshot_account: tuple[str, str] | None = None
         self._reconciliation_snapshot_at: float | None = None
         self._registry_names: frozenset[str] = frozenset()
-        # 预启动：已就绪但还在等开盘行情的合约（name -> 该项的放行截止时间）。
-        # 这些策略已 resume、trading=True，但 live_trading=False，不会有任何报单。
+        # 待命合约（无截止时间）：已初始化，但 live_trading=False，不会新发单。
         self.armed: dict[str, float] = {}
+        self._armed_session: tuple | None = None
+        self.arm_blockers: dict[str, str] = {}
         self._startup_query_done = False
         self._orders_restored = False
         self._recovered_orderids: set[str] = set()
@@ -604,7 +602,8 @@ class SpreadTradingControl:
                     index.setdefault(value, sysid)
         return index
 
-    def _prune_orders_absent_from_cabinet(self, name: str, config) -> int:
+    def _prune_orders_absent_from_cabinet(self, name: str, config, *,
+                                          reserved_before_query=None) -> int:
         """以柜台**当日委托快照**为准，清掉本地记录里“柜台已经没有”的委托。
 
         CTP 委托当日有效，交易所的当日委托列表只含当前交易日，所以
@@ -648,9 +647,12 @@ class SpreadTradingControl:
                 oms = getter("oms")
         except Exception:
             oms = None
-        local = set(self._recovered_orderids)
-        local |= {str(row.get("orderid", ""))
-                  for row in (self._saved_orders.get(name) or [])}
+        if reserved_before_query is not None:
+            local = set(reserved_before_query)
+        else:
+            local = set(self._recovered_orderids)
+            local |= {str(row.get("orderid", ""))
+                      for row in (self._saved_orders.get(name) or [])}
         dropped: list[str] = []
         for orderid in sorted(local):
             if not orderid or still_at_cabinet(orderid):
@@ -1588,7 +1590,8 @@ class SpreadTradingControl:
             return "一致"
         return "补充" if supplement else "同步"
 
-    def sync_spread_position(self, name: str, *, force: bool = False) -> str:
+    def sync_spread_position(self, name: str, *, force: bool = False,
+                             runtime: bool = False) -> str:
         """按柜台持仓同步本地价差账：空仓则清零，两腿匹配则接管为策略层。
 
         只做“本地账对齐柜台”的写操作，不发单、不撤单；核对确认状态保留，
@@ -1685,8 +1688,9 @@ class SpreadTradingControl:
         # 一律清掉本地记录；快照不可用时这一步什么都不做（交给下面的兜底规则）。
         pruned = self._prune_orders_absent_from_cabinet(name, config)
         trimmed_total = 0.0
-        # 用户点“核对并纠正”即视为已人工核对：顺手清掉本次登录后从未有回报的旧委托记忆。
-        pruned += self._prune_stale_order_records(name, config)
+        # 运行兜底只使用本轮完整柜台证据，不走人工纠正的时间戳兜底。
+        if not runtime:
+            pruned += self._prune_stale_order_records(name, config)
         blockers: list[str] = []
         try:
             active_orders = [
@@ -1812,7 +1816,8 @@ class SpreadTradingControl:
                 strategy.reserved_exit_orders.clear()
         else:
             # 层账已建立：先清掉方向与当前层矛盾的旧平仓单，再绑定仍然有效的。
-            pruned += self._prune_stale_order_records(name, config, check_directions=True)
+            if not runtime:
+                pruned += self._prune_stale_order_records(name, config, check_directions=True)
             self._bind_existing_exit_orders(name, config, strategy, spread)
         # 无论空仓还是有仓，柜台已有的建仓/加仓委托都占住开仓槽位。
         self._bind_existing_open_orders(name, config, strategy)
@@ -1876,16 +1881,15 @@ class SpreadTradingControl:
                 if not self.master_running or name not in self.enabled or not (was_live or deadline is not None):
                     raise ManagedSpreadError('该合约未获交易许可')
                 config = self.validate(name)
-                if was_live:
+                if was_live and not runtime:
                     problem = self.quote_problem(config)
                     if problem:
                         raise ManagedSpreadError(problem)
-                elif deadline <= monotonic():
-                    raise ManagedSpreadError('预启动已超时')
                 if not strategy.resume_strategy(reconciled=True):
                     raise ManagedSpreadError('暂停期间订单未核对，禁止恢复')
                 self.validate(name)
                 if was_live:
+                    strategy.runtime_position_blocked = False
                     strategy.live_trading = True
                     message += '；该合约已恢复交易'
                 else:
@@ -2370,7 +2374,7 @@ class SpreadTradingControl:
         ``preopen=True`` 允许在没有盘口（未开盘／集合竞价）时先挂好：策略照常
         初始化、接管层账、绑定委托并恢复（``paused=False``、``trading=True``），
         但 ``live_trading`` 保持 False，因此不会有任何报单；等 :meth:`tick_armed`
-        看到两腿都有有效报价的那一刻，才逐合约开启实盘发单。默认 ``False`` 时
+        看到有效两腿报价且重新核验柜台事实后，才逐合约开启实盘发单。默认 ``False`` 时
         行为不变：没有有效报价直接拒绝启动。
         """
         if self.master_running:
@@ -2393,6 +2397,8 @@ class SpreadTradingControl:
                 arming.append(name)
             checked[name] = config
         self.armed.clear()
+        self.arm_blockers.clear()
+        self._armed_session = self.startup_session()
         started: list[str] = []
         try:
             for name, config in checked.items():
@@ -2433,17 +2439,25 @@ class SpreadTradingControl:
                 strategy._rebuild_filters()
                 if not strategy.resume_strategy(reconciled=True):
                     raise ManagedSpreadError(f"{name} 暂停期间订单未核对，禁止恢复")
+                td = getattr(self._gateway(), "td_api", None)
+                evidence = self._startup_snapshot_identity(td)
                 self.validate(name)
                 writer = getattr(strategy, "write_log", None)
-                if name in arming:
-                    # 预启动：策略已就绪但不放行实盘；tick_armed() 看到报价再开。
+                if self.startup_session() != self._armed_session:
+                    raise ManagedSpreadError("启动时交易会话变化，禁止放行")
+                problem = self.quote_problem(config)
+                if self._startup_snapshot_identity(td) != evidence:
+                    problem = "柜台查询或回报在核验期间发生变化，等待重新核验"
+                if problem and not preopen:
+                    raise ManagedSpreadError(problem)
+                strategy.runtime_position_blocked = False
+                if name in arming or problem:
+                    # 待命：策略已就绪但不放行实盘，行情与柜台检查均通过才开。
                     strategy.live_trading = False
-                    self.armed[name] = monotonic() + ARM_MAX_WAIT
+                    self.armed[name] = float("inf")
+                    self.arm_blockers[name] = problem or "等待下一轮开盘核验"
                     if callable(writer):
-                        writer(
-                            "预启动：策略已就绪，但未开启实盘发单（live_trading=False）；"
-                            "两腿报价就绪后自动放行，超时则自动停止"
-                        )
+                        writer("策略已待命，实盘发单关闭；两腿报价和柜台核验通过后自动放行")
                 else:
                     strategy.live_trading = True
                     if callable(writer):
@@ -2460,96 +2474,87 @@ class SpreadTradingControl:
             writer = getattr(self.main_engine, "write_log", None)
             if callable(writer):
                 writer(
-                    f"预启动：{len(self.armed)} 个合约已就绪，等待开盘报价后自动放行"
-                    f"（最长等待 {ARM_MAX_WAIT:.0f} 秒，超时自动停止且不发任何委托）"
+                    f"预启动：{len(self.armed)} 个合约持续待命，等待有效报价和柜台核验"
                 )
         return started
 
-    def tick_armed(self) -> list[str]:
-        """预启动看门狗：报价就绪的合约逐个放行，超时／核对失效则整体停止。
+    def startup_session(self) -> tuple | None:
+        """启动仅授权当前已连接的交易会话，不继承到另一个账户或重登录。"""
+        if not (self.md_ready() and self.td_ready()):
+            return None
+        td = getattr(self._gateway(), "td_api", None)
+        return (id(td), self._account_key(), getattr(td, "frontid", None),
+                getattr(td, "sessionid", None), getattr(td, "account_cache_token", None))
 
-        由界面定时器每 500ms 调一次（``SpreadConsoleWidget.arm_timer``）。
-        放行只改 ``live_trading``，不再重跑 validate——核对与持仓校验在 arm
-        时已经做过，这里只补“盘口已经有了”这个唯一缺的条件。
-        """
-        if not self.armed:
+    @staticmethod
+    def _startup_snapshot_identity(td) -> tuple:
+        return tuple(getattr(td, field, None) for field in (
+            "position_query_generation", "position_query_pending", "position_snapshot_at",
+            "orders_query_pending", "orders_snapshot_ok", "orders_snapshot_at", "reconciliation_event_error"))
+
+    def tick_armed(self) -> list[str]:
+        """持续待命；仅在当前会话、盘口和柜台核验均通过后逐个放行。"""
+        if not self.master_running or not self.armed:
+            return []
+        if self.startup_session() != self._armed_session:
+            self.stop_all(reason="交易会话已断开或变化，已取消待命")
             return []
         writer = getattr(self.main_engine, "write_log", None)
-
-        def log(message: str) -> None:
-            if callable(writer):
-                writer(message)
-
-        if monotonic() > max(self.armed.values()):
-            self.stop_all(reason="预启动超时：开盘后仍无有效报价，已停止（未发任何委托）")
-            log("预启动超时：等待报价超过 "
-                f"{ARM_MAX_WAIT:.0f} 秒，已停止全部策略（期间没有发出任何委托）")
-            return []
-        td = getattr(self._gateway(), "td_api", None)
-        problem = self._armed_revoked_reason(td)
-        if problem:
-            self.stop_all(reason=f"预启动已撤销：{problem}；请重新核对后手动开始")
-            log(f"预启动已撤销：{problem}；期间没有发出任何委托，请重新核对后再开始")
-            return []
         released: list[str] = []
         for name in list(self.armed):
             config = self.service.get(name)
             strategy = self._strategy(name) if config is not None else None
-            if config is None or strategy is None:
+            if name not in self.enabled:
                 self.armed.pop(name, None)
+                self.arm_blockers.pop(name, None)
                 continue
-            if name not in self.reconciled_contracts:
-                self.armed.pop(name, None)
-                log(f"{name} 预启动放行失败：该合约的柜台核对已失效，需重新核对后才能开始")
+            if config is None or strategy is None or not strategy.trading or strategy.paused:
+                self.arm_blockers[name] = "策略未就绪，请检查策略状态"
                 continue
-            if self.quote_problem(config):
+            problem = self.quote_problem(config)
+            if problem:
+                self.arm_blockers[name] = problem
                 continue
+            try:
+                td = getattr(self._gateway(), "td_api", None)
+                evidence = self._startup_snapshot_identity(td)
+                self.validate(name)
+                spread = self.spread_engine.get_spread(name)
+                # 等待期间可能出现人工委托，重新依据当日快照占位，避免重复报单。
+                self._prune_orders_absent_from_cabinet(name, config)
+                if spread is not None and strategy.layers:
+                    self._bind_existing_exit_orders(name, config, strategy, spread)
+                self._bind_existing_open_orders(name, config, strategy)
+                self.validate(name)
+                self._validate_quote(config)
+            except ManagedSpreadError as exc:
+                self.arm_blockers[name] = str(exc)
+                continue
+            if self.startup_session() != self._armed_session:
+                self.stop_all(reason="放行时交易会话已变化，已取消待命")
+                return released
+            if self._startup_snapshot_identity(td) != evidence:
+                self.arm_blockers[name] = "柜台查询或回报在核验期间发生变化，等待重新核验"
+                continue
+            strategy.runtime_position_blocked = False
             strategy.live_trading = True
             self.armed.pop(name, None)
+            self.arm_blockers.pop(name, None)
             released.append(name)
-            log(f"{name} 预启动放行：两腿报价已就绪，实盘发单开启（live_trading=True）")
-        if released and not self.armed:
-            log(f"预启动完成：{len(released)} 个合约已全部放行实盘")
+            if callable(writer):
+                writer(f"{name} 待命放行：两腿报价与柜台核验通过，实盘发单开关已开启")
         return released
 
     @property
     def armed_names(self) -> list[str]:
-        """仍在等开盘报价的合约（界面用）。"""
+        """仍在等待盘口或柜台安全条件的合约（界面用）。"""
         return sorted(self.armed)
-
-    def _armed_revoked_reason(self, td) -> str:
-        """预启动期间是否必须撤销：只看“核对依据是否已失效”。
-
-        和 :meth:`_snapshot_problem` 的区别：这里不因一次在途查询（``pending``）、
-        短暂的“尚未完整返回”就停手——那是正常的查询节奏，500ms 一次轮询会把它
-        当成致命错误。只有快照过期、账户变了、回报解析失败这类**不可自愈**的
-        情况才撤销。
-        """
-        if td is None:
-            return "交易接口不可用"
-        if hasattr(td, "login_status") and not getattr(td, "login_status", False):
-            return "交易端未登录"
-        if hasattr(td, "contract_inited") and not getattr(td, "contract_inited", False):
-            return "合约目录尚未就绪"
-        sides = getattr(td, "position_snapshot_sides", None)
-        if isinstance(sides, dict):
-            stamp = float(getattr(td, "position_snapshot_at", 0) or 0)
-            if stamp and monotonic() - stamp > SNAPSHOT_MAX_AGE:
-                return f"持仓快照已超过 {SNAPSHOT_MAX_AGE:.0f} 秒，请重新核对"
-            account = getattr(td, "position_snapshot_account", None)
-            if account is not None and account != self._account_key():
-                return "快照账户与当前登录账户不一致，请重新核对"
-        orders_stamp = float(getattr(td, "orders_snapshot_at", 0) or 0)
-        if orders_stamp and monotonic() - orders_stamp > SNAPSHOT_MAX_AGE:
-            return f"当日委托快照已超过 {SNAPSHOT_MAX_AGE:.0f} 秒，请重新核对柜台委托"
-        error = getattr(td, "reconciliation_event_error", "")
-        if error:
-            return f"柜台回报待核实：{error}"
-        return ""
 
     def stop_all(self, *, reason: str = "用户停止交易"):
         self.master_running = False
         self.armed.clear()
+        self.arm_blockers.clear()
+        self._armed_session = None
         # 停止交易不等于核对失效：保留几分钟内的核对快照，关窗再开不必重来。
         self.invalidate_reconciliation(forget=False)
         for strategy in self.spread_engine.strategy_engine.strategies.values():

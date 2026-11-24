@@ -46,9 +46,10 @@ class ScheduleAgent(QtCore.QObject):
     CHECK_INTERVAL_MS = 10_000
 
     def __init__(self, control, main_engine, plan: SchedulePlan, path: Path,
-                 *, auto_start: bool = True) -> None:
+                 *, auto_start: bool = True, stop_trading=None) -> None:
         super().__init__()
         self.control = control
+        self.stop_trading = stop_trading
         self.main_engine = main_engine
         self.plan = plan
         self.path = Path(path)
@@ -201,10 +202,16 @@ class ScheduleAgent(QtCore.QObject):
         self._log("定时任务：逐笔报单门禁尚未接入，不启动无人值守实盘；需要人工核对")
 
     def _stop(self, now: datetime) -> None:
-        if not self.control.master_running:
-            self._log("定时任务：当前未在交易，跳过停止")
+        if self.stop_trading is not None:
+            stopped = self.stop_trading(reason="定时任务停止交易")
+        elif self.control.master_running:
+            self.control.stop_all(reason="定时任务停止交易")
+            stopped = True
+        else:
+            stopped = False
+        if not stopped:
+            self._log("定时任务：当前未在交易或待命，跳过停止")
             return
-        self.control.stop_all(reason="定时任务停止交易")
         self._log("定时任务：已停止交易（已有委托保留，仍可能成交）")
 
     # ------------------------------------------------------------ 日志

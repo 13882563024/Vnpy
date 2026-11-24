@@ -4,15 +4,18 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 from math import isfinite
-from time import monotonic
+from time import monotonic, time
 from types import SimpleNamespace
 
 from utils.calendar import trading_day_str
+from . import overview_cache
 
 UNKNOWN = '未知'
 MAX_AGE = 300  # Same five-minute window as the reconciliation console.
 # 平时约 10 秒刷新一次，给逐笔核验和请求排队留出余量。
 VIEW_MAX_AGE = 20
+ACCOUNT_VIEW_MAX_AGE = 45
+QUOTE_MAX_AGE = 30
 
 
 class OverviewCacheBusy(RuntimeError):
@@ -78,6 +81,7 @@ def _cabinet(td, now):
     scoped = login is True and all(scope) and getattr(td, '_login_scope', scope) == scope
     healthy = scoped and not getattr(td, 'reconciliation_event_error', '')
     sides = _view_sides(td, now, (broker, user)) if healthy else None
+    position_at = getattr(td, 'position_view_at', None) if sides is not None else None
     if sides is None:
         # 视图快照不可用时退回核对快照（更严：要求账户/时效/无在途查询）。
         sides = getattr(td, 'position_snapshot_sides', None)
@@ -87,6 +91,8 @@ def _cabinet(td, now):
                 and getattr(td, 'position_snapshot_account', None) == (broker, user)
                 and _fresh(td, 'position_snapshot_at', now)):
             sides = None
+        else:
+            position_at = td.position_snapshot_at
     ids = getattr(td, 'orders_snapshot', None)
     complete = bool(healthy and isinstance(ids, (set, frozenset)) and getattr(td, 'orders_snapshot_ok', False)
                     and not getattr(td, 'orders_query_pending', False) and _fresh(td, 'orders_snapshot_at', now))
@@ -94,7 +100,14 @@ def _cabinet(td, now):
     if healthy:
         confirmed.update(getattr(td, 'live_seen_orderids', ()))
     cache = {o.vt_orderid: o for o in getattr(td, '_order_cache', {}).copy().values()} if healthy else {}
-    return scope if scoped else None, login, sides, complete, confirmed, cache
+    # Use the frozen query view for history. The live order cache may contain later
+    # callbacks, which must not be stamped as if observed during an older query.
+    last_active = getattr(td, 'orders_snapshot_active', None)
+    historical_orders = (getattr(td, 'orders_snapshot_at', None), last_active.copy()) if (
+        complete and isinstance(last_active, dict)
+        and getattr(td, 'orders_snapshot_activity_generation', None)
+        == getattr(td, '_position_activity_generation', None)) else (None, {})
+    return scope if scoped else None, login, sides, complete, confirmed, cache, position_at, historical_orders
 
 
 def _legs(symbols, sides):
@@ -408,7 +421,81 @@ def _local_layers(rows):
     return layers
 
 
-def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_local=None) -> dict:
+def _account_values(main_engine, gateway, td, scope, now):
+    if not scope:
+        return {}, None
+    accounts = [a for a in _cached(main_engine, 'get_all_accounts') if getattr(a, 'gateway_name', None) == gateway
+                and getattr(a, 'accountid', None) == scope[1]]
+    if len(accounts) != 1:
+        return {}, None
+    account = accounts[0]
+    stamp = getattr(account, 'ctp_observed_at', None)
+    session = getattr(td, 'account_cache_token', None)
+    observed = (session is not None and getattr(account, 'ctp_cache_token', None) is session
+                and _fresh(account, 'ctp_observed_at', now, ACCOUNT_VIEW_MAX_AGE))
+    # A previous OMS account object can linger after reconnect. Never show it as live.
+    if session is not None and not observed:
+        return {}, None
+    fields = dict(balance='balance', available='available', margin='curr_margin',
+                  realized='close_profit', unrealized='position_profit')
+    values = {key: _number(getattr(account, attr, None)) for key, attr in fields.items()}
+    return values, stamp if observed else None
+
+
+def _quote_sample(spread, gw, gateway, symbols, config, wall):
+    """Require recent quotes from both legs, not the spread object's initial defaults."""
+    if (getattr(getattr(gw, 'md_api', None), 'login_status', None) is not True
+            or spread is None or len(symbols) != 2):
+        return None
+    legs = getattr(spread, 'legs', {})
+    calculated = getattr(spread, 'datetime', None)
+    formula = config.get('price_formula') or 'near - far'
+    if (not isinstance(legs, dict) or set(legs) != set(symbols)
+            or getattr(spread, 'variable_symbols', None) != dict(zip(('near', 'far'), symbols))
+            or getattr(spread, 'price_formula', None) != formula
+            or not isinstance(calculated, datetime) or calculated.tzinfo is None):
+        return None
+    stamps = []
+    for symbol in symbols:
+        tick = getattr(legs.get(symbol), 'tick', None)
+        dt = getattr(tick, 'datetime', None)
+        if (getattr(tick, 'gateway_name', None) != gateway or not isinstance(dt, datetime)
+                or dt.tzinfo is None):
+            return None
+        stamp = dt.timestamp()
+        if not 0 <= wall - stamp <= QUOTE_MAX_AGE:
+            return None
+        stamps.append(stamp)
+    bid, ask = (_number(getattr(spread, k, None)) for k in ('bid_price', 'ask_price'))
+    if (calculated.timestamp() < max(stamps) or calculated != getattr(spread, 'datetime', None)
+            or bid is None or ask is None or bid > ask or any(
+                (_number(getattr(spread, k, None)) or 0) <= 0 for k in ('bid_volume', 'ask_volume'))):
+        return None  # missing/crossed quotes or calculation still being published
+    return {'at': max(stamps), 'value': f'{(bid + ask) / 2:g}'}
+
+
+def _stamp(epoch):
+    return datetime.fromtimestamp(epoch).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+
+
+def _offline_account(view, scope, history):
+    if not history:
+        return
+    view['source'] = '本地缓存 · 上次柜台快照（历史，非实时）'
+    mode = '实盘' if scope.production else '测试'
+    view['account'] = f'{scope.broker} / {scope.user}（{mode}历史）'
+    view['day'] = history['day']
+    account = history['account']
+    if account:
+        view['updated'] = '上次资金快照 ' + _stamp(account['at'])
+        for key, value in account['value'].items():
+            view[key] = _money(value) + '（历史）'
+    else:
+        view['updated'] = '历史记录；时间见各价差详情'
+
+
+def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_local=None,
+                  cache=None) -> dict:
     """Build display strings; priority 0 is most urgent. Config never grants permission."""
     view = dict.fromkeys(('account', 'day', 'connection', 'balance', 'available', 'margin', 'realized', 'unrealized'), UNKNOWN)
     gateway, gw = _gateway(main_engine)
@@ -417,7 +504,12 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_l
     if lock is not None and not lock.acquire(blocking=False):
         raise OverviewCacheBusy('网关缓存正在更新')
     try:
-        scope, login, sides, complete, confirmed, orders = _cabinet(td, monotonic())
+        now, wall = monotonic(), time()
+        scope, login, sides, complete, confirmed, orders, position_at, historical_orders = _cabinet(td, now)
+        order_at, last_active = historical_orders
+        # A single actual CTP gateway, not paper or a guessed account identity.
+        cache_scope = overview_cache.gateway_scope(td) if gateway == 'CTP' and cache is not None else None
+        values, account_at = _account_values(main_engine, gateway, td, scope, now)
     finally:
         if lock is not None:
             lock.release()
@@ -435,21 +527,31 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_l
     if scope:
         broker, user, view['day'] = scope
         view['account'] = f'{broker} / {user}'
-        accounts = [a for a in _cached(main_engine, 'get_all_accounts') if getattr(a, 'gateway_name', None) == gateway
-                    and getattr(a, 'accountid', None) == user]
-        if len(accounts) == 1:
-            a = accounts[0]
-            for key, field in [('balance', 'balance'), ('available', 'available'), ('margin', 'curr_margin'),
-                               ('realized', 'close_profit'), ('unrealized', 'position_profit')]:
-                view[key] = _money(getattr(a, field, None))
-    offline = not scope and login is not True and read_local is not None
-    layer_book, pnl_book = read_local() if offline else ({}, {})
+        if cache_scope is not None:
+            mode = '实盘' if cache_scope.production else '测试'
+            view['source'] = f'CTP {mode}柜台'
+        for key, value in values.items():
+            view[key] = _money(value)
+    offline = not scope and login is not True and (read_local is not None or cache is not None)
+    layer_book, pnl_book = read_local() if offline and read_local is not None else ({}, {})
     local_day = trading_day_str(datetime.now()) if offline else ''
+    history = {}
     if offline:
-        view['source'] = '本地缓存（未连接柜台）'
+        view['source'] = ('本地缓存 · 层账/收益未绑定柜台账户' if layer_book or pnl_book else '无可用本地缓存')
         view['connection'] = '交易端未登录'
-        for key in ('balance', 'available', 'margin', 'realized', 'unrealized'):
+        for key in overview_cache.METRICS:
             view[key] = '未连接柜台'
+        if cache is not None and gateway == 'CTP':
+            configured = cache.configured_scope()
+            if cache_scope is None or configured is None or cache_scope == configured:
+                cache_scope = cache_scope or configured
+                history = cache.load(cache_scope)
+                _offline_account(view, cache_scope, history)
+    def wall_at(stamp):
+        # Persist seconds, not sub-microsecond clock calibration jitter between refreshes.
+        return round(wall - (now - stamp))
+
+    observed_rows = {}
     strategies = getattr(getattr(spread_engine, 'strategy_engine', None), 'strategies', {}).copy()
     strategy_by_name: dict[str, object] = {}
     for name in configs:
@@ -490,13 +592,27 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_l
         leg_label = (f'近 {legs[0]} / 远 {legs[1]} · 仓位未知'
                      if len(legs) == 2 and leg_text == UNKNOWN else leg_text)
         prices = _layer_legs(strategy, legs)
-        live_price = _live_spread(spread)
+        quote = _quote_sample(spread, gw, gateway, legs, cfg, wall) if scope and cache_scope else None
+        live_price = (quote['value'] if quote else UNKNOWN) if cache_scope else _live_spread(spread)
+        identity = overview_cache.spread_identity(cfg) if cache_scope else None
+        if scope and cache_scope:
+            observed = {'identity': identity}
+            if quote:
+                observed['live'] = quote
+            if position_at is not None and leg_text != UNKNOWN:
+                observed['cabinet'] = {'at': wall_at(position_at), 'value': leg_text}
+            if order_at is not None:
+                _, historical_certain, historical_text = _order_rows(
+                    legs, combo, last_active, set(last_active), True, gateway)
+                if historical_certain:
+                    observed['orders'] = {'at': wall_at(order_at), 'value': historical_text}
+            observed_rows[name] = observed
         target = _take_profit_spread(strategy)
         add = _add_spread(strategy, active)
         total = getattr(strategy, 'total_realized', None)
         today = getattr(strategy, 'daily_realized', None)
         if offline:
-            cached_layers = _local_layers(layer_book.get(name)) if name in layer_book else local
+            cached_layers = _local_layers(layer_book.get(name))
             display_book = SimpleNamespace(layers=cached_layers)
             known_empty = layer_book.get(name) == []
             layers = f'本地 {len(cached_layers)} 层' if cached_layers or known_empty else UNKNOWN
@@ -508,17 +624,36 @@ def overview_view(configs: dict, main_engine=None, spread_engine=None, *, read_l
             entry = pnl_book.get(name)
             total = entry.get('total') if isinstance(entry, dict) else None
             today = entry.get('today') if isinstance(entry, dict) and entry.get('day') == local_day else None
-            detail = '\n'.join(('配置腿：' + ' / '.join(legs), '柜台持仓未核实；以下为本地记录。',
-                               *(_layer_legs(SimpleNamespace(layers=[layer]), legs)
-                                 for layer in sorted(cached_layers, key=lambda x: x.layer_index, reverse=True))))
+            details = ['配置腿：' + ' / '.join(legs), '当前柜台持仓未核实。']
+            if shared:
+                details.append('共享合约：账户腿仓不能归属本价差。')
+            if cached_layers or known_empty or isinstance(entry, dict):
+                details.append('本地层账/收益按价差名记录，未绑定柜台账户。')
+            details.extend(_layer_legs(SimpleNamespace(layers=[layer]), legs)
+                           for layer in sorted(cached_layers, key=lambda x: x.layer_index, reverse=True))
             order_text = '未连接柜台，无法确认当前活动委托。'
+            prior = history.get('rows', {}).get(name, {})
+            if prior and prior['identity'] == identity:
+                if cabinet := prior.get('cabinet'):
+                    leg_label = cabinet['value'] + '（历史）'
+                    details.append(f"历史腿仓 {_stamp(cabinet['at'])}：{cabinet['value']}")
+                if quote := prior.get('live'):
+                    live_price = quote['value'] + '（历史）'
+                    details.append(f"历史价差 {_stamp(quote['at'])}：{quote['value']}")
+                if previous_orders := prior.get('orders'):
+                    order_text += f"\n\n历史委托 {_stamp(previous_orders['at'])}（非当前）：\n{previous_orders['value']}"
+                status = '历史快照 · 待核对'
+            detail = '\n'.join(details)
         else:
             order_text += '\n仅列活动委托，不含成交明细'
         view['rows'].append(dict(name=name, display=_display_name(cfg, name), held=held, layers=layers,
                                  legs=prices, live=live_price, take_profit=target, add=add,
-                                 log=_latest_log(strategy),
+                                 log=UNKNOWN if offline else _latest_log(strategy),
                                  total=_pnl_text(total), today=_pnl_text(today),
                                  cabinet=leg_label, protection=protection, opening=opening,
                                  priority=priority, status=status,
                                  detail=detail, orders=order_text))
+    if scope and cache_scope:
+        account = {'at': wall_at(account_at), 'value': values} if account_at is not None else None
+        cache.save(cache_scope, scope[2], account, observed_rows)
     return view

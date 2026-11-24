@@ -146,6 +146,8 @@ class SpreadCtpTdApi(CtpTdApi):
         self._account_query_reqid: int | None = None
         self._account_query_started_at = 0.0
         self.account_cache_token = object()
+        # Display-only identity of the actual registered TD front (never credentials).
+        self.overview_front: tuple[str, bool] | None = None
         self._flight_request: tuple[str, int] | None = None
         self._flight_reqids: set[int] = set()  # 迟到的逐笔请求回包不能进入普通 OMS 轮询
         self.journal_path = journal_path
@@ -196,7 +198,11 @@ class SpreadCtpTdApi(CtpTdApi):
         self.orders_snapshot_sysids: dict[str, str] = {}
         self.orders_snapshot_at: float = 0.0
         self.orders_snapshot_ok: bool = False
+        self.orders_snapshot_activity_generation: int | None = None
+        self._orders_query_activity_generation = 0
         self._orders_query_rows: set[str] = set()
+        self._orders_query_active: dict[str, OrderData] = {}
+        self.orders_snapshot_active: dict[str, OrderData] = {}
         self._orders_query_sysids: dict[str, str] = {}
         # 视图用的持仓快照：每次完整查询（含后台 auto）都刷新，只供展示；
         # 与核对用的 position_snapshot_* 分开，避免"后台刷新冒充人工核对"。
@@ -277,6 +283,9 @@ class SpreadCtpTdApi(CtpTdApi):
         self.orders_query_pending = False
         self._orders_query_reqid = None
         self._orders_query_rows = set()
+        self._orders_query_active = {}
+        self.orders_snapshot_active = {}
+        self.orders_snapshot_activity_generation = None
         self.orders_snapshot = set()
         self.orders_snapshot_sysids = {}
         self.orders_snapshot_at = 0.0
@@ -483,6 +492,23 @@ class SpreadCtpTdApi(CtpTdApi):
                 self.gateway.write_log(f'后台查询持仓失败：{exc}')
 
     @_serialized_send_state
+    def request_runtime_check(self, kind: str) -> bool:
+        """低优先级核对：不要抢占人工查询、普通在途查询或逐笔报单核验。"""
+        if (not self.login_status or not self.contract_inited or not self.cabinet_trading_day
+                or self.query_collector.active or self.position_query_pending
+                or self.orders_query_pending or self._trades_query_reqid is not None
+                or self._account_query_reqid is not None
+                or monotonic() - self._last_query_at < self.QUERY_MIN_INTERVAL):
+            return False
+        if kind == 'position':
+            self.query_position()
+        elif kind == 'orders':
+            self.query_orders()
+        else:
+            raise ValueError(kind)
+        return True
+
+    @_serialized_send_state
     def query_account(self) -> None:
         if not self.login_status or not self.cabinet_trading_day or self.query_collector.active:
             return
@@ -600,7 +626,9 @@ class SpreadCtpTdApi(CtpTdApi):
         if not self.contract_inited or not symbol_contract_map:
             raise RuntimeError("柜台合约目录尚未就绪，无法发起委托查询")
         self.orders_query_pending = True
+        self._orders_query_activity_generation = self._position_activity_generation
         self._orders_query_rows = set()
+        self._orders_query_active = {}
         self._orders_query_sysids = {}
         self.orders_snapshot_ok = False       # 新查询开始：旧快照立刻作废
         self.orders_snapshot_at = 0.0
@@ -650,6 +678,10 @@ class SpreadCtpTdApi(CtpTdApi):
                 self.gateway.write_log(self.reconciliation_event_error)
                 self._abort_orders_snapshot()
                 return
+            if order.is_active():
+                self._orders_query_active[order.vt_orderid] = order
+            else:
+                self._orders_query_active.pop(order.vt_orderid, None)
             self._publish_order(order, data)
             sysid = str(data.get("OrderSysID") or "").strip()
             if sysid:
@@ -657,6 +689,8 @@ class SpreadCtpTdApi(CtpTdApi):
         if last:
             self.orders_snapshot = set(self._orders_query_rows)
             self.orders_snapshot_sysids = dict(self._orders_query_sysids)
+            self.orders_snapshot_active = dict(self._orders_query_active)
+            self.orders_snapshot_activity_generation = self._orders_query_activity_generation
             self.orders_snapshot_at = monotonic()
             self.orders_snapshot_ok = True
             self.orders_query_pending = False
@@ -1134,6 +1168,10 @@ class SpreadCtpTdApi(CtpTdApi):
                 f"组合单 CombOffsetFlag 位数 = {self.offset_flag_width}"
                 f"（默认 1 位，按 CTP 官方指南一位即可）"
             )
+        if not self.connect_status:
+            self.overview_front = (address, production_mode)
+        # Repeated connect() on an initialized API authenticates on the old front;
+        # don't relabel its data as originating from the newly entered server.
         super().connect(address, userid, password, brokerid, auth_code, appid, production_mode)
 
     @_serialized_send_state

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from time import monotonic
 
 from vnpy.trader.ui import QtCore, QtWidgets
 from vnpy_spreadtrading import APP_NAME
@@ -218,6 +219,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
     # CTP 查询接口每秒限流；资金与持仓必须错开发送，拒绝时再退避重试。
     QUERY_GAP_MS = 1100
     QUERY_RETRIES = 3
+    STARTUP_QUERY_RETRY_SECONDS = 30
     # 委托/成交回报到达时立即刷新详情页（跨线程用队列连接）。
     order_changed = QtCore.Signal()
     # 价差数据到达就刷新报价行：否则只能等 1 秒一次的界面定时器，看起来"比腿慢一倍"。
@@ -238,9 +240,18 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         # 自动纠正模式：查询完成后不再弹确认窗口，直接确认核对并批量纠正。
         self._auto_mode = False
         self._repair_target: str | None = None
-        # 用户点了「开始交易」但还没核对完：纠正成功后自动接上启动。
         self._pending_start = False
+        self._startup_scope: tuple | None = None
+        self._startup_names: set[str] = set()
+        self._startup_query = False
+        self._startup_query_cancel_requested = False
+        self._startup_needs_sync = False
+        self._next_startup_query = 0.0
         self._position_query_attempts = 0
+        # 开盘前可持续待命；等两腿盘口及柜台核验都通过再放行。
+        self.arm_timer = QtCore.QTimer(self)
+        self.arm_timer.setInterval(500)
+        self.arm_timer.timeout.connect(self._check_armed)
         self.setWindowTitle("价差交易 · 跨期合约管理")
         self.setMinimumSize(1050, 660)
         self._build_ui()
@@ -258,14 +269,18 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(1000)
-        # 预启动看门狗：盘前点「开始交易」后在这里等两腿报价，就绪即放行实盘。
-        self.arm_timer = QtCore.QTimer(self)
-        self.arm_timer.setInterval(500)
-        self.arm_timer.timeout.connect(self._check_armed)
+        if event_engine is not None and hasattr(event_engine, 'register'):
+            from vnpy.trader.event import EVENT_TIMER
+            from spreadconsole.runtime_reconcile import RuntimeReconciler
+
+            self.runtime_reconciler = RuntimeReconciler(
+                self.control, startup_busy=lambda: self.startup_busy)
+            event_engine.register(EVENT_TIMER, self.runtime_reconciler.on_timer)
         # 定时代理：连接 / 核对纠正 / 启停交易，配置在 config/schedule.json
         self.schedule_agent = ScheduleAgent(
             self.control, main_engine,
-            SchedulePlan.load(DEFAULT_SCHEDULE_PATH), DEFAULT_SCHEDULE_PATH)
+            SchedulePlan.load(DEFAULT_SCHEDULE_PATH), DEFAULT_SCHEDULE_PATH,
+            stop_trading=self._stop_trading)
 
     def _on_spread_event(self, event) -> None:
         """价差 tick 到达 → 立即更新报价行（只处理当前选中的价差）。"""
@@ -528,8 +543,16 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
     def _confirm_reconciliation(self, batch: bool = False):
         if self._reconciliation_pending:
             return
+        if getattr(getattr(self, "runtime_reconciler", None), "busy", False):
+            self._repair_target = None
+            self._auto_mode = False
+            self.notice.setText("后台持仓核验进行中，请稍后再试")
+            return
         if not self.control.md_ready() or not self.control.td_ready():
-            QtWidgets.QMessageBox.warning(self, "无法查询", "请先连接交易端和行情端")
+            if self._startup_query:
+                self._startup_query = self._auto_mode = False
+            else:
+                QtWidgets.QMessageBox.warning(self, "无法查询", "请先连接交易端和行情端")
             return
         self._batch_sync = bool(batch)
         gateway = self.control._gateway()
@@ -551,8 +574,17 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             return
         QtCore.QTimer.singleShot(self.QUERY_GAP_MS, self._request_position_query)
 
+    def _startup_query_cancelled(self) -> bool:
+        if not self._startup_query or (not self._startup_query_cancel_requested
+                                      and self._startup_scope_valid()):
+            return False
+        self._fail_reconciliation("已取消待命核对", "交易会话或启动意图已变化")
+        return True
+
     def _request_position_query(self):
         """单独发起持仓查询；柜台限流（-1/-2/-3）时退避重试，不当作空仓。"""
+        if self._startup_query_cancelled():
+            return
         try:
             self.control._gateway().query_position()
         except Exception as exc:
@@ -570,6 +602,8 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
 
     def _request_order_query(self):
         """查询当日委托，拿到每笔单的最终状态（CTP 的 ReqQryOrder）。"""
+        if self._startup_query_cancelled():
+            return
         td = getattr(self.control._gateway(), "td_api", None)
         if td is None or not hasattr(td, "query_orders"):
             self._show_reconciliation_result()
@@ -591,15 +625,20 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         self._repair_target = None
         self._reconciliation_pending = False
         self._batch_sync = False
-        self._pending_start = False
+        startup_query, self._startup_query = self._startup_query, False
         self._auto_mode = False
         self.reconcile.setEnabled(True)
         self.reconcile.setText("核对柜台状态")
-        QtWidgets.QMessageBox.warning(self, title, text)
+        if self._startup_scope_valid():
+            self.notice.setText(f"持续待命：{title}：{text}；未通过核对的合约不新发单")
+        elif not startup_query:
+            QtWidgets.QMessageBox.warning(self, title, text)
         self._refresh()
 
 
     def _show_reconciliation_result(self):
+        if self._startup_query_cancelled():
+            return
         try:
             report = self.control.reconciliation_report()
         except Exception as exc:
@@ -700,6 +739,11 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             "\n程序只能展示已查询到的状态，请再与主终端的委托/成交记录核对。"
         )
         repair_target, self._repair_target = self._repair_target, None
+        startup_query, self._startup_query = self._startup_query, False
+        if startup_query and not self._startup_scope_valid():
+            self._batch_sync = self._auto_mode = False
+            self._refresh()
+            return  # 用户已停止或登录变化，异步查询不得确认、纠正或重启策略。
         if self._auto_mode or repair_target:
             # 自动纠正：不再让用户点确认，直接走确认+纠正。
             accepted = True
@@ -725,7 +769,12 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
                 else:
                     self.notice.setText("柜台核对已确认；可逐个开启合约交易许可")
             except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "核对确认失败", str(exc))
+                if startup_query:
+                    self.notice.setText(f"持续待命，柜台确认未通过：{exc}")
+                else:
+                    QtWidgets.QMessageBox.warning(self, "核对确认失败", str(exc))
+        if startup_query:
+            self._auto_mode = False
         self._batch_sync = False
         self._refresh()
 
@@ -735,7 +784,7 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         ok = [name for name, kind, _ in results if kind == "ok"]
         skip = [name for name, kind, _ in results if kind == "skip"]
         fails = [(name, message) for name, kind, message in results if kind == "fail"]
-        if fails and not self._batch_retry_done and all(
+        if fails and not self._pending_start and not self._batch_retry_done and all(
                 "快照" in message for _, message in fails):
             # 用户看核对弹窗的这几秒里柜台又推了回报，持仓/委托快照按设计立即作废，
             # 于是纠正被拒。这里自动重查一轮再纠正（只重试一次），
@@ -760,22 +809,20 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         # 只有"已勾选交易"的合约纠正失败才阻断自动启动；没勾选的（例如 PK）
         # 本来就停在人工处理，不该拖住其它合约。
         blocking = [name for name, _ in fails if name in self.control.enabled]
-        if fails and (blocking or not self._pending_start):
-            self._pending_start = False
+        if self._pending_start:
+            self._auto_mode = False
+            if blocking:
+                self.notice.setText("持续待命；部分已勾选合约尚未纠正：" + "；".join(
+                    f"{name}：{message}" for name, message in fails if name in blocking))
+                return
+            self._startup_needs_sync = False
+            self._start_trading()
+        elif fails:
             self._auto_mode = False
             QtWidgets.QMessageBox.warning(
                 self, "部分合约未纠正",
                 summary + "\n\n" + "\n\n".join(f"{name}：{message}" for name, message in fails[:6]),
             )
-            return
-        if self._pending_start:
-            # 用户点的是「开始交易」：纠正成功后直接接上，不再让他点第二次。
-            self._pending_start = False
-            self._auto_mode = False
-            if fails:
-                self.notice.setText(
-                    summary + "；未勾选交易的合约留待人工处理，现在开始交易")
-            self._start_trading()
 
     def _repair_all_positions(self):
         """一次完成“核对 + 全部合约纠正”，不用逐个点。"""
@@ -852,75 +899,112 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "未能更改交易许可", str(exc))
         self._refresh()
 
-    def _toggle_master(self):
-        if self.control.master_running:
-            self.arm_timer.stop()
-            self.control.stop_all()
-            self.notice.setText("策略已暂停：现有委托不撤销，可能继续成交；已有持仓不再自动止损")
-        else:
-            names = sorted(self.control.enabled)
-            if not names:
-                QtWidgets.QMessageBox.information(self, "没有可启动的合约", "先逐个开启合约的交易许可")
-                return
-            stale = [name for name in names if not self.control.is_reconciled(name)]
-            if stale:
-                # 没有有效核对就不再让用户先点核对再点开始：自动查一遍、纠正、再启动。
-                if self._reconciliation_pending:
-                    self._pending_start = True
-                    self.notice.setText("柜台查询中，完成后自动开始交易…")
-                    return
-                self._pending_start = True
-                self._auto_mode = True
-                self._batch_retry_done = False
-                self.notice.setText("正在自动核对并纠正本地持仓/委托，完成后自动开始交易…")
-                self._confirm_reconciliation(batch=True)
-                return
-            self._start_trading()
-        self._refresh()
+    @property
+    def startup_busy(self) -> bool:
+        """柜台查询或人工启动流程占用时，后台维护不应并发查询。"""
+        return self._reconciliation_pending or self._pending_start
 
-    def _start_trading(self):
-        """真正启动：报价/预启动判断都放这里，供自动纠正后回调。"""
+    def _clear_startup(self):
+        self._pending_start = False
+        self._startup_scope = None
+        self._startup_names.clear()
+        if self._startup_query:
+            self._startup_query_cancel_requested = True
+        self._startup_needs_sync = False
+        self.arm_timer.stop()
+
+    def _stop_trading(self, *, reason: str = "用户停止交易") -> bool:
+        if not (self._pending_start or self.control.master_running):
+            return False
+        self._clear_startup()
+        self.control.stop_all(reason=reason)
+        self.notice.setText(f"{reason}：已取消待命并暂停策略；已有委托保留，仍可能成交，不会自动止损")
+        self._refresh()
+        return True
+
+    def _startup_snapshots_missing(self, names) -> bool:
+        td = getattr(self.control._gateway(), "td_api", None)
+        return any(not self.control.is_reconciled(name) for name in names) or bool(
+            self.control._orders_snapshot_problem(td))
+
+    def _begin_startup_query(self):
+        runtime = getattr(self, "runtime_reconciler", None)
+        if self._reconciliation_pending or getattr(runtime, "busy", False) or not self._startup_scope_valid():
+            return
+        self._next_startup_query = monotonic() + self.STARTUP_QUERY_RETRY_SECONDS
+        self._startup_query = self._auto_mode = True
+        self._startup_query_cancel_requested = False
+        self._batch_retry_done = False
+        # 待命期间刷新柜台事实，不打断已实盘运行的合约，也不自动重写逐层账。
+        self._confirm_reconciliation(batch=self._pending_start and self._startup_needs_sync)
+
+    def _startup_scope_valid(self) -> bool:
+        return (self._startup_scope is not None
+                and self._startup_scope == self.control.startup_session()
+                and self.control.enabled.issubset(self._startup_names))
+
+    def _toggle_master(self):
+        if self._stop_trading():
+            return
         names = sorted(self.control.enabled)
         if not names:
+            QtWidgets.QMessageBox.information(self, "没有可启动的合约", "先逐个开启合约的交易许可")
             return
-        try:
-            for name in names:
-                self.control.validate(name)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "未启动交易", str(exc))
+        scope = self.control.startup_session()
+        if scope is None:
+            QtWidgets.QMessageBox.warning(self, "无法启动", "请先连接交易端和行情端")
             return
+        if not self._confirm_start(names):
+            return
+        self._startup_scope = scope
+        self._startup_names = set(names)
+        self._pending_start = True
+        if not self._startup_scope_valid():
+            self._stop_trading(reason="交易会话或许可已变化")
+            return
+        self._next_startup_query = 0.0
+        self.arm_timer.start()
+        self._startup_needs_sync = self._startup_snapshots_missing(names)
+        if self._reconciliation_pending or self._startup_needs_sync:
+            self.notice.setText("已待命：正在等待柜台核对；条件未满足前不新发单")
+            self._begin_startup_query()
+            self._refresh()
+            return
+        self._start_trading()
+
+    def _confirm_start(self, names) -> bool:
         waiting = [name for name in names if self._quote_problem(name)]
+        text = "即将为以下合约启用实盘策略：\n" + "\n".join(names)
         if waiting:
-            text = (
-                "以下合约目前没有可交易报价（未开盘或行情未到）：\n"
-                + "\n".join(waiting)
-                + "\n\n将以「预启动」方式开始：策略立即初始化、接管持仓并绑定已有委托，"
-                  "但不会发出任何报单；两腿报价就绪时自动逐个开启实盘发单，"
-                  "超时或核对依据过期则自动停止（同样不发单）。\n\n确认预启动？"
-            )
-        else:
-            text = ("即将为以下合约启用实盘策略：\n" + "\n".join(names)
-                    + "\n\n停止后旧委托不会自动撤销，也不会自动平仓。确认开始？")
-        answer = QtWidgets.QMessageBox.question(
+            text += "\n\n尚无有效两腿报价：" + "、".join(waiting)
+        text += ("\n\n未满足有效盘口和柜台核验时持续待命、不新发单；条件通过后自动放行。"
+                 "停止交易不会撤销现有委托或自动平仓。确认开始？")
+        return QtWidgets.QMessageBox.question(
             self, "确认实盘交易", text,
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No,
-        )
-        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+        ) == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _start_trading(self):
+        """接续已确认的人工启动；任何安全校验失败都不放行。"""
+        if not self._pending_start or not self._startup_scope_valid():
             return
         try:
             started = self.control.start_all(preopen=True)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "启动失败，已暂停策略", str(exc))
+        except ManagedSpreadError as exc:
+            self.notice.setText(f"继续待命，未放行：{exc}")
+            self._next_startup_query = max(self._next_startup_query, monotonic() + self.STARTUP_QUERY_RETRY_SECONDS)
             self._refresh()
             return
+        except Exception as exc:
+            self._stop_trading(reason="启动异常")
+            QtWidgets.QMessageBox.warning(self, "启动失败，已暂停策略", str(exc))
+            return
+        self._pending_start = False
         if self.control.armed:
-            self.arm_timer.start()
-            detail = f"（另有 {len(started)} 个已直接放行）" if started else ""
-            self.notice.setText(
-                f"预启动：{len(self.control.armed)} 个合约已就绪，等待开盘报价后自动放行实盘"
-                + detail)
+            self.notice.setText(f"{len(self.control.armed)} 个合约持续待命，等待有效盘口与柜台核验")
         else:
+            self._clear_startup()
             self.notice.setText("策略已启用：" + "、".join(started))
         self._refresh()
 
@@ -935,37 +1019,47 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
             return str(exc)
 
     def _check_armed(self):
-        """预启动轮询：报价就绪就放行，超时/核对失效则整体停止。"""
-        if not self.control.armed:
-            self.arm_timer.stop()
-            self._refresh()
+        """等待盘口或柜台核对，超时只影响单次查询，不取消人工启动。"""
+        if not self._startup_scope_valid() or not self.control.enabled:
+            if not self._stop_trading(reason="交易会话或许可已变化，取消待命"):
+                self._clear_startup()
+            return
+        if self._reconciliation_pending:
             return
         try:
+            now = monotonic()
+            if self._pending_start:
+                names = sorted(self.control.enabled)
+                if now < self._next_startup_query:
+                    return
+                if self._startup_snapshots_missing(names) or self._startup_needs_sync:
+                    if any(not self._quote_problem(name) for name in names):
+                        self._begin_startup_query()
+                else:
+                    self._start_trading()
+                return
+            if not self.control.master_running:
+                self._clear_startup()
+                self.notice.setText("待命已取消，策略已暂停")
+                self._refresh()
+                return
             released = self.control.tick_armed()
-        except Exception as exc:      # noqa: BLE001 - 轮询异常必须停手，不能带病放行
-            self.arm_timer.stop()
-            try:
-                self.control.stop_all(reason=f"预启动轮询异常：{exc}")
-            except Exception:
-                pass
-            self.notice.setText(f"预启动异常，已停止（未发任何委托）：{exc}")
-            self._refresh()
-            return
-        if not self.control.armed:
-            self.arm_timer.stop()
-            if self.control.master_running:
-                self.notice.setText(
-                    "预启动完成：行情已就绪，"
-                    + ("、".join(released) if released else "全部合约")
-                    + " 已开启实盘发单")
-            else:
-                self.notice.setText("预启动已结束，没有发出任何委托；详见日志")
-            self._refresh()
-        elif released:
-            self.notice.setText(
-                f"预启动放行 {len(released)} 个（{'、'.join(released)}），"
-                f"仍在等待 {len(self.control.armed)} 个：" + "、".join(self.control.armed_names))
-            self._refresh()
+            if not self.control.armed:
+                self._clear_startup()
+                if not self.control.master_running:
+                    self.notice.setText("待命已取消，策略已暂停")
+                elif released:
+                    self.notice.setText("待命结束，以下合约已开启实盘发单：" + "、".join(released))
+                self._refresh()
+                return
+            ready = [name for name in self.control.armed_names if not self._quote_problem(name)]
+            if released:
+                self.notice.setText(f"已放行 {'、'.join(released)}；其余合约继续待命")
+                self._refresh()
+            if ready and now >= self._next_startup_query and self._startup_snapshots_missing(ready):
+                self._begin_startup_query()
+        except Exception as exc:      # noqa: BLE001 - 意外程序错误必须停手，不能带病放行
+            self._stop_trading(reason=f"待命检查异常：{exc}")
 
     def _edit_config(self):
         name = self._name()
@@ -1387,13 +1481,15 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         try:
             self.control.refresh()
         except Exception as exc:
+            self._clear_startup()
             try:
                 self.control.stop_all(reason="界面状态刷新失败")
             except Exception:
                 pass  # 配置损坏时仍展示原始错误，禁止 GUI 继续交易
             self.notice.setText(f"价差状态刷新失败，已暂停策略：{exc}")
         self.connection.setText(f"行情：{'已连接' if self.control.md_ready() else '未连接'}   交易：{'已连接' if self.control.td_ready() else '未连接'}")
-        self.master.setText("停止交易" if self.control.master_running else "开始交易")
+        self.master.setText("停止交易" if self.control.master_running else
+                            "取消待命" if self._pending_start else "开始交易")
         if not self._reconciliation_pending:
             moment = self.control.last_reconciliation_at
             self.reconcile.setText(
@@ -1420,8 +1516,8 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
         name = self._name()
         config = configs.get(name)
         self.per_contract.setEnabled(bool(config))
-        self.config_button.setEnabled(bool(config))
-        self.remove_button.setEnabled(bool(config) and not self.control.master_running)
+        self.config_button.setEnabled(bool(config) and not self._pending_start)
+        self.remove_button.setEnabled(bool(config) and not self.control.master_running and not self._pending_start)
         if not config:
             self._quote_name = None
             self.title.setText("选择一个合约查看详情")
@@ -1452,7 +1548,14 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
                       and strategy.trading and strategy.live_trading and not strategy.paused)
         self.per_contract.setText("暂停此合约交易" if name in self.control.enabled else "允许此合约交易")
         error = self.control.errors.get(name, "")
-        state = "交易中" if active else "策略暂停 · 不新发单、不撤已有委托"
+        if active:
+            state = ("持仓待核对 · 已阻止新策略委托"
+                     if getattr(strategy, 'runtime_position_blocked', False) else "交易中")
+        elif name in self.control.armed or (self._pending_start and name in self._startup_names):
+            blocker = self.control.arm_blockers.get(name, "等待柜台核验")
+            state = f"持续待命 · 不新发单 · {blocker}"
+        else:
+            state = "策略暂停 · 不新发单、不撤已有委托"
         if config.contract_status == "verified":
             state += " · 合约已验证"
         elif config.contract_status == "pending_verification":
@@ -1477,11 +1580,8 @@ class SpreadConsoleWidget(QtWidgets.QWidget):
     def closeEvent(self, event):
         # 面板只是展示层：关闭窗口**不**停止策略，后台继续按既定逻辑运行。
         # 停止交易请点「停止交易」；退出主程序时策略随进程结束。
-        if self.control.master_running:
+        if self.control.master_running or self._pending_start:
             writer = getattr(self.main_engine, "write_log", None)
             if callable(writer):
-                writer(
-                    "价差管理窗口已关闭：策略仍在后台运行；"
-                    "如需停止交易请重新打开窗口点「停止交易」"
-                )
+                writer("价差管理窗口已关闭：后台交易或待命继续；如需取消请重新打开窗口")
         super().closeEvent(event)

@@ -263,7 +263,8 @@ class SnapshotTests(unittest.TestCase):
         api = self.api
         api.orders_query_pending = True
         api._orders_query_reqid = 7
-        order = SimpleNamespace(vt_orderid="CTP.1_2_3")
+        order = SimpleNamespace(vt_orderid="CTP.1_2_3", is_active=lambda: True)
+        api._orders_query_activity_generation = 17
         with patch.object(api, "_order_from_query", return_value=order), \
                 patch.object(api, "_publish_order"):
             api.onRspQryOrder({"InstrumentID": "a2701", "FrontID": 1, "SessionID": 2,
@@ -272,6 +273,8 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(api.orders_snapshot_ok)
         self.assertEqual(api.orders_snapshot_sysids, {"12345": "CTP.1_2_3"})
         self.assertIn("CTP.1_2_3", api.orders_snapshot)
+        self.assertEqual(api.orders_snapshot_active, {"CTP.1_2_3": order})
+        self.assertEqual(api.orders_snapshot_activity_generation, 17)
 
     def test_auto_query_updates_oms_without_publishing_snapshot(self):
         """后台刷新持仓要喂给 OMS，但不能改写人工核对快照。"""

@@ -1411,6 +1411,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         """
         if not (self.trading and self.live_trading and not self.paused):
             return False
+        if getattr(self, 'runtime_position_blocked', False):
+            return False  # 持仓兜底已确认账实不符；不另外发单，等对齐或人工处置。
         if self.executor_mode not in (EXECUTOR_TWO_LEG, EXECUTOR_EXCHANGE_SPREAD):
             return False
         if (self.executor_mode == EXECUTOR_EXCHANGE_SPREAD
@@ -1688,6 +1690,19 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._log_order_basis("平仓", request, price, algoid)
 
     # ================================================================ 预挂止盈
+    def check_take_profit(self) -> None:
+        """事件线程定时兜底：不触发开仓、加仓或止损，只走原来的顶层止盈路径。"""
+        if not self.layers or not self.exit_preplace or not self._can_send():
+            return
+        snapshot = self._build_snapshot()
+        if snapshot is None or any(
+            not leg.quoted or leg.datetime is None or abs(time.time() - leg.datetime.timestamp()) > 5
+            for leg in (snapshot.near, snapshot.far)
+        ):
+            return
+        self._maybe_preplace_exit()
+        self._refresh_variables()
+
     def _maybe_preplace_exit(self, moment: datetime | None = None) -> None:
         """只给**最新层**预挂止盈单：同一合约同一时刻只存在一个止盈单。
 

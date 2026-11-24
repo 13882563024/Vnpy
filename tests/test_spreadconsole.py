@@ -1004,19 +1004,18 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(self.strategy.live_trading)
         self.assertTrue(self.control.master_running)
 
-    def test_preopen_times_out_and_stops(self):
+    def test_preopen_remains_armed_after_long_wait(self):
         self.control.enabled.add(self.config.name)
         self.main.get_tick = lambda _: None
         self.control.start_all(preopen=True)
-        self.control.armed[self.config.name] = monotonic() - 1     # 已过截止时间
+        with patch("spreadconsole.control.monotonic", return_value=monotonic() + 10_000):
+            self.assertEqual(self.control.tick_armed(), [])
 
-        self.assertEqual(self.control.tick_armed(), [])
-
-        self.assertFalse(self.control.master_running)
+        self.assertTrue(self.control.master_running)
+        self.assertEqual(self.control.armed_names, [self.config.name])
         self.assertFalse(self.strategy.live_trading)
-        self.assertTrue(self.strategy.paused)
 
-    def test_preopen_revoked_when_snapshot_expires(self):
+    def test_preopen_does_not_release_when_snapshot_expires(self):
         self.control.enabled.add(self.config.name)
         self.main.get_tick = lambda _: None
         self.control.start_all(preopen=True)
@@ -1024,9 +1023,39 @@ class ControlTests(unittest.TestCase):
         td.position_snapshot_sides = {}
         td.position_snapshot_account = ("", "")
         td.position_snapshot_at = monotonic() - 10_000
+        td.contract_inited = True
+        self.spread.leg_pos = {}
+        self.main.get_tick = lambda _: SimpleNamespace(
+            bid_price_1=100, ask_price_1=101, datetime=datetime.now())
 
-        self.control.tick_armed()
+        self.assertEqual(self.control.tick_armed(), [])
+        self.assertTrue(self.control.master_running)
+        self.assertEqual(self.control.armed_names, [self.config.name])
+        self.assertFalse(self.strategy.live_trading)
 
+        td.position_snapshot_at = monotonic()
+        self.control.confirm_reconciliation()
+        self.assertEqual(self.control.tick_armed(), [self.config.name])
+        self.assertTrue(self.strategy.live_trading)
+
+    def test_preopen_blocks_incomplete_orders_snapshot_and_cancels_on_session_change(self):
+        td = self.gateway.td_api
+        td.frontid, td.sessionid = 3, 4
+        td.orders_snapshot_ok, td.orders_snapshot_at = True, monotonic()
+        self.control.enabled.add(self.config.name)
+        self.main.get_tick = lambda _: None
+        self.control.start_all(preopen=True)
+
+        self.main.get_tick = lambda _: SimpleNamespace(
+            bid_price_1=100, ask_price_1=101, datetime=datetime.now())
+        td.orders_query_pending = True
+        self.assertEqual(self.control.tick_armed(), [])
+        self.assertIn(self.config.name, self.control.armed)
+        self.assertFalse(self.strategy.live_trading)
+
+        td.orders_query_pending = False
+        td.sessionid += 1
+        self.assertEqual(self.control.tick_armed(), [])
         self.assertFalse(self.control.master_running)
         self.assertEqual(self.control.armed, {})
         self.assertFalse(self.strategy.live_trading)
@@ -1462,6 +1491,87 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.strategy.closed_layers[0].realized_pnl, 0)
         self.assertEqual(self.spread.leg_pos, {near: 2, far: -2})
 
+    def test_runtime_watchdog_restores_two_layers_and_releases_terminal_slot(self):
+        from execution.base import PositionLayer
+        from spreadconsole.runtime_reconcile import RuntimeReconciler
+        from strategies.cross_period_mean_reversion import CrossPeriodMRStrategy
+
+        self._running_repair()
+        td = self.gateway.td_api
+        td.position_snapshot_sides = {
+            'a2701': {'long': 2, 'short': 0}, 'a2703': {'long': 0, 'short': 2}}
+        td.orders_snapshot = {'CTP.terminal'}
+        td.orders_snapshot_active = {}
+        near, far = self.config.legs
+        self.spread.leg_pos = {near: 2, far: -2}
+        self.spread.net_pos = 2
+        self.spread.calculate_pos.side_effect = lambda: setattr(self.spread, 'net_pos', self.spread.leg_pos[near])
+        self.strategy.layers = [PositionLayer(layer_index=i, volume=1, avg_spread=-i)
+                                for i in (1, 2, 3)]
+        self.strategy.layers[-1].algoid = 'CTP.terminal'
+        self.strategy.reserved_exit_orders['CTP.terminal'] = self.strategy.layers[-1].tier_id
+        self.strategy.closed_layers = []
+        self.strategy.spread = self.spread
+        self.strategy._snapshot = None
+        self.strategy._refresh_variables = self.strategy._save_layers = self.strategy.write_log = Mock()
+        self.strategy.trim_legacy_position = lambda: CrossPeriodMRStrategy.trim_legacy_position(self.strategy)
+        watchdog = RuntimeReconciler(self.control, startup_busy=lambda: False)
+        self.control.confirm_reconciliation()
+        watchdog._apply(td, self.config, {self.config.name: self.config}, {'CTP.terminal'})
+        self.assertEqual([layer.layer_index for layer in self.strategy.layers], [1, 2])
+        self.assertEqual(self.strategy.closed_layers[0].realized_pnl, 0)
+        self.assertEqual(self.strategy.reserved_exit_orders, {})
+        self.assertTrue(self.strategy.live_trading)
+        self.assertFalse(self.strategy.runtime_position_blocked)
+        self.assertEqual(self.other.pause_count, 0)
+
+    def test_runtime_watchdog_drops_pair_if_order_or_fill_arrived_between_queries(self):
+        from spreadconsole.runtime_reconcile import RuntimeReconciler
+
+        self._running_repair()
+        td = self.gateway.td_api
+        td.account_cache_token = object()
+        td._position_activity_generation = 5
+        td.position_query_generation = 0
+        td.orders_query_pending = False
+        td.orders_snapshot_activity_generation = 5
+
+        def request(kind):
+            if kind == 'position':
+                td.position_query_generation += 1
+                td.position_snapshot_at = monotonic()
+            else:
+                td.orders_snapshot_at = monotonic()
+            return True
+
+        td.request_runtime_check = Mock(side_effect=request)
+        watchdog = RuntimeReconciler(self.control, startup_busy=lambda: False)
+        watchdog._apply = Mock()
+        watchdog.on_timer()
+        watchdog.on_timer()
+        self.assertEqual([call.args[0] for call in td.request_runtime_check.call_args_list],
+                         ['position', 'orders'])
+        td._position_activity_generation += 1
+        watchdog.on_timer()
+        watchdog._apply.assert_not_called()
+        self.assertFalse(watchdog.busy)
+
+    def test_runtime_watchdog_keeps_cabinet_active_exit_and_defers_sync(self):
+        from spreadconsole.runtime_reconcile import RuntimeReconciler
+
+        self._running_repair()
+        td = self.gateway.td_api
+        order = self._exit_order('CTP.active', datetime.now().astimezone())
+        td.orders_snapshot = {order.vt_orderid}
+        td.orders_snapshot_active = {order.vt_orderid: order}
+        self.strategy.reserved_exit_orders[order.vt_orderid] = ''
+        watchdog = RuntimeReconciler(self.control, startup_busy=lambda: False)
+        watchdog._apply(td, self.config, {self.config.name: self.config}, {order.vt_orderid})
+        self.assertIn(order.vt_orderid, self.strategy.reserved_exit_orders)
+        self.assertTrue(self.strategy.runtime_position_blocked)
+        self.assertFalse(self.strategy.paused)
+        self.spread_engine.data_engine.save_pos.assert_not_called()
+
     def test_running_repair_defers_while_live_algo_is_inflight(self):
         self._running_repair()
         self.spread_engine.algo_engine.algos['working'] = SimpleNamespace(is_order_finished=lambda: False)
@@ -1761,7 +1871,8 @@ class WidgetTests(unittest.TestCase):
         widget, control = self._make_widget(master_running=False)
         control.enabled = {"A_2701_2703"}
         control.is_reconciled.return_value = False
-        with patch.object(widget, "_confirm_reconciliation") as reconcile, \
+        with patch.object(widget, "_confirm_start", return_value=True), \
+                patch.object(widget, "_confirm_reconciliation") as reconcile, \
                 patch.object(widget, "_start_trading") as start:
             widget._toggle_master()
 
@@ -1778,8 +1889,7 @@ class WidgetTests(unittest.TestCase):
         with patch.object(widget, "_start_trading") as start:
             widget._run_batch_sync([])
 
-        start.assert_called_once()
-        self.assertFalse(widget._pending_start)
+        start.assert_called_once()  # 实际启动成功后才清除待命意图。
         self.assertFalse(widget._auto_mode)
 
     def test_batch_sync_failure_does_not_autostart(self):
@@ -1793,7 +1903,8 @@ class WidgetTests(unittest.TestCase):
             widget._run_batch_sync([])
 
         start.assert_not_called()
-        self.assertFalse(widget._pending_start)
+        self.assertTrue(widget._pending_start)
+        self.assertIn("持续待命", widget.notice.text())
 
     def test_batch_sync_ignores_failure_of_contracts_not_enabled(self):
         """PK 这类没勾选交易的合约纠正失败，不该拦住其它合约启动。"""
@@ -1806,7 +1917,45 @@ class WidgetTests(unittest.TestCase):
             widget._run_batch_sync([])
 
         start.assert_called_once()
+
+    def test_query_failure_stays_armed_and_retries_only_with_quotes(self):
+        widget, control = self._make_widget(master_running=False)
+        control.enabled = {"A_2701_2703"}
+        control.is_reconciled.return_value = False
+        control.armed = {}
+        with patch.object(widget, "_confirm_start", return_value=True), \
+                patch.object(widget, "_confirm_reconciliation") as reconcile, \
+                patch.object(QtWidgets.QMessageBox, "warning") as warning, \
+                patch.object(widget, "_quote_problem", return_value="无报价") as quote:
+            widget._toggle_master()
+            widget._fail_reconciliation("柜台未返回", "本轮查询超时")
+            self.assertTrue(widget._pending_start)
+            self.assertTrue(widget.arm_timer.isActive())
+            self.assertEqual(widget.master.text(), "取消待命")
+            widget._next_startup_query = 0
+            widget._check_armed()
+            self.assertEqual(reconcile.call_count, 1)
+            quote.return_value = ""
+            widget._check_armed()
+            widget._check_armed()
+            self.assertEqual(reconcile.call_count, 2)
+            warning.assert_not_called()
+        control.start_all.assert_not_called()
+
+    def test_schedule_stop_cancels_async_startup_query(self):
+        widget, control = self._make_widget(master_running=False)
+        control.enabled = {"A_2701_2703"}
+        control.is_reconciled.return_value = False
+        with patch.object(widget, "_confirm_start", return_value=True), \
+                patch.object(widget, "_confirm_reconciliation"):
+            widget._toggle_master()
+            widget.schedule_agent._stop(datetime.now())
+            widget._show_reconciliation_result()  # 已排队的查询回调无权继续。
+        control.stop_all.assert_called_once_with(reason="定时任务停止交易")
+        control.confirm_reconciliation.assert_not_called()
+        control.start_all.assert_not_called()
         self.assertFalse(widget._pending_start)
+        self.assertFalse(widget.arm_timer.isActive())
 
     def test_close_window_keeps_strategy_running(self):
         """2026-11-11 反馈：叉掉价差窗口后策略要留在后台继续跑。"""

@@ -308,6 +308,33 @@ class TestLegacyPositionAdoption(unittest.TestCase):
         self.assertEqual(engine.algos, {})          # 不再挂第二张止盈
         self.assertEqual(layer.algoid, "CTP.9_1_2")  # 该层显示已有平仓单
 
+    def test_take_profit_timer_uses_existing_gate_and_does_not_duplicate(self) -> None:
+        from types import SimpleNamespace
+        from execution.base import PositionLayer
+        from unittest.mock import patch
+        from utils.filters import LegSnapshot
+
+        strategy, engine, _spread = make_strategy()
+        strategy.direction = DIRECTION_LONG
+        strategy.layers.append(PositionLayer(direction=DIRECTION_LONG, volume=1, avg_spread=-20,
+                                             near_price=5265, far_price=5285, layer_index=1))
+        leg = LegSnapshot(bid_price=100, ask_price=101, datetime=MOMENT)
+        with patch.object(strategy, '_build_snapshot', return_value=SimpleNamespace(near=leg, far=leg)), \
+                patch.object(strategy, '_clock', return_value=MOMENT), \
+                patch('strategies.cross_period_mean_reversion.time.time', return_value=MOMENT.timestamp() + 7):
+            strategy.check_take_profit()
+            self.assertFalse(engine.algos)
+        with patch.object(strategy, '_build_snapshot', return_value=SimpleNamespace(near=leg, far=leg)), \
+                patch.object(strategy, '_clock', return_value=MOMENT), \
+                patch('strategies.cross_period_mean_reversion.time.time', return_value=MOMENT.timestamp()):
+            strategy.runtime_position_blocked = True
+            strategy.check_take_profit()
+            self.assertFalse(engine.algos)
+            strategy.runtime_position_blocked = False
+            strategy.check_take_profit()
+            strategy.check_take_profit()
+            self.assertEqual(len(engine.algos), 1)
+
     def test_preplace_exit_waits_for_cabinet_confirmation(self) -> None:
         """柜台没确认这笔仓位前不挂平仓单，避免“平仓量超过持仓量”。"""
         from execution.base import PositionLayer

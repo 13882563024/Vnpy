@@ -10,6 +10,7 @@ from vnpy.trader.ui import MainWindow
 
 from utils import layer_store, pnl_ledger
 
+from . import overview_cache
 from .model import DEFAULT_CONFIG, load_snapshot
 from .overview_data import UNKNOWN, OverviewCacheBusy, overview_view
 from .overview_page import OverviewPage
@@ -82,7 +83,7 @@ class HomeTerminal(MainWindow):
 
     def show_professional(self):
         if self._at_home:
-            self._timer.stop()
+            # Keep observing the last cabinet data while the professional docks are open.
             if self._detail:
                 self._detail.hide()
             self.home.hide()
@@ -114,7 +115,8 @@ class HomeTerminal(MainWindow):
             problem = f'配置读取失败：{exc}'
         try:
             view = overview_view(self._configs, self.main_engine, self._spread_engine,
-                                 read_local=lambda: (layer_store.read_all(), pnl_ledger.read_all()))
+                                 read_local=lambda: (layer_store.read_all(), pnl_ledger.read_all()),
+                                 cache=overview_cache)
         except OverviewCacheBusy:
             # A busy writer is transient. Keep the whole last frame rather than mixing it
             # with placeholders, and keep its original timestamp visible.
@@ -137,6 +139,8 @@ class HomeTerminal(MainWindow):
         if problem:
             view['source'] = problem
         self._rows = {r['name']: r for r in view['rows']}
+        if not self._at_home:
+            return
         self.home.set_view(view)
         if self._detail and self._detail.isVisible():
             self._refresh_detail()
