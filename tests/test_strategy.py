@@ -71,6 +71,7 @@ class FakeEngine:
         self.strategies: dict[str, object] = {}
         self.logs: list[str] = []
         self.counter = 0
+        self.stop_calls: list[str] = []
 
     def reset_logs(self) -> None:
         self.logs.clear()
@@ -85,6 +86,7 @@ class FakeEngine:
         return algoid
 
     def stop_algo(self, strategy, algoid: str) -> None:
+        self.stop_calls.append(algoid)
         algo = self.algos.get(algoid)
         if algo is None or not algo.is_active():
             return
@@ -881,6 +883,54 @@ class TestTakeProfitRejection(unittest.TestCase):
         for _ in range(50):
             strategy._maybe_preplace_exit(MOMENT)
         self.assertEqual([log for log in engine.logs if "转为低频重试" in log], [])
+
+
+class TestStartupFailureRecovery(unittest.TestCase):
+    """2026-11-23 夜盘回归：算法在启动过程中就终止时，策略收不到终态回调。
+
+    vn.py 在 ``spread_engine.start_algo()`` 返回之后才把策略登记进
+    ``algo_strategy_map``，所以「启动即失败」的算法不会回调 ``on_spread_algo``。
+    当天 4 张止盈单就是这样被逐笔核验拒发后永久占住 ``exit_algoid``：
+    该层整晚没有止盈单，另一个策略还每 tick 撤一个不存在的算法（刷了 6000 行日志）。
+    """
+
+    def _open_layer(self) -> tuple[CrossPeriodMRStrategy, FakeEngine]:
+        strategy, engine, spread = make_strategy(
+            {"min_exit_pnl_override": 10, "exit_retry_backoff": "0"})
+        warm_up(strategy, [-100.0, -100.4] * 20)
+        feed_quote(spread, 4000, 4001, 4102, 4103)
+        strategy.on_spread_data()
+        engine.fill(engine.active_algos("open")[0].algoid, price=-101.0)
+        strategy.cabinet_position_check = lambda direction, volume: True
+        return strategy, engine
+
+    def test_dead_algo_releases_exit_slot_and_reprepares(self) -> None:
+        strategy, engine = self._open_layer()
+        dead = strategy.exit_algoid
+        self.assertTrue(dead)
+        engine.algos.pop(dead)              # 引擎已回收，策略却从没收到终态回调
+        self.assertIn(dead, strategy.algoids)
+
+        strategy._maybe_preplace_exit(MOMENT)
+
+        self.assertNotEqual(strategy.exit_algoid, dead)
+        self.assertNotIn(dead, strategy.algoids)
+        self.assertTrue(any("未收到终态回调" in log for log in engine.logs), engine.logs)
+        self.assertEqual(len(engine.active_algos("take_profit")), 1)
+
+    def test_cancel_for_transition_does_not_stop_missing_algo(self) -> None:
+        strategy, engine = self._open_layer()
+        dead = strategy.exit_algoid
+        engine.algos.pop(dead)
+        engine.stop_calls.clear()
+
+        strategy._cancel_for_transition(dead)
+
+        # 不再对一个不存在的算法反复撤单，占位直接释放
+        self.assertEqual(engine.stop_calls, [])
+        self.assertEqual(strategy.exit_algoid, "")
+        self.assertNotIn(dead, strategy.algoids)
+        self.assertTrue(any("已不在引擎里" in log for log in engine.logs), engine.logs)
 
 
 class TestPositionReconcile(unittest.TestCase):

@@ -59,7 +59,8 @@ class FakeTd:
 
 
 class IntegrationTests(unittest.TestCase):
-    def _algo(self, extra_overrides=None, *, send_result='CTP.1', gate=True):
+    def _algo(self, extra_overrides=None, *, send_result='CTP.1', gate=True,
+              cabinet_day='2026-11-20', replace_extra=False):
         engine = SpreadAlgoEngine.__new__(SpreadAlgoEngine)
         engine.order_algo_map = {}
         engine.data_engine = Mock()
@@ -73,6 +74,7 @@ class IntegrationTests(unittest.TestCase):
         engine.cancel_order = Mock()
         engine.put_algo_event = Mock()
         td = FakeTd()
+        td.cabinet_trading_day = cabinet_day
         main_engine = SimpleNamespace(
             send_order=Mock(return_value=send_result),
             get_all_active_orders=lambda: [],
@@ -89,7 +91,10 @@ class IntegrationTests(unittest.TestCase):
             'max_open_lots': 3, 'margin_per_lot': 5000.0,
             'config_version': 'cfg-v1', 'trading_sessions': 'always',
         }
-        extra.update(extra_overrides or {})
+        if replace_extra:
+            extra = dict(extra_overrides or {})
+        else:
+            extra.update(extra_overrides or {})
         with patch.object(CrossPeriodAlgo, '_quotes_current', return_value=True), \
                 patch.object(CrossPeriodAlgo, '_session_open', return_value=True):
             algo = CrossPeriodAlgo(engine, 'algo', make_spread(), Direction.LONG, -14,
@@ -195,6 +200,31 @@ class IntegrationTests(unittest.TestCase):
 
         self.assertFalse(algo._gate.busy)
         self.assertTrue(any('放弃' in log for log in self._logs(engine)), self._logs(engine))
+
+    def test_missing_context_says_which_item_is_missing(self):
+        """缺核验上下文时必须说清缺哪一项：2026-11-23 夜盘 4 张止盈单就卡在这句话里。"""
+        algo, engine, td = self._algo(cabinet_day='')
+
+        logs = self._logs(engine)
+        self.assertTrue(any('逐笔核验上下文缺失' in log for log in logs), logs)
+        self.assertTrue(any('柜台交易日' in log for log in logs), logs)
+        self.assertEqual(algo.impl.order_ids, [])
+
+    def test_missing_extra_key_is_named(self):
+        """extra 少键也要点名，而不是只说"缺少逐笔核验上下文"。"""
+        extra = {
+            'purpose': 'take_profit', 'mode': 'exchange_spread',
+            'exchange_spread': 'SP A2612&A2701',
+            'exchange_spread_vt_symbol': 'SP A2612&A2701.DCE',
+            'tier_id': 'tier-1', 'near': 'A2612', 'far': 'A2701',
+            'near_vt': 'A2612.DCE', 'far_vt': 'A2701.DCE', 'exchange': 'DCE',
+            'max_open_lots': 3, 'margin_per_lot': 5000.0,
+        }
+        algo, engine, td = self._algo(extra, replace_extra=True)
+
+        logs = self._logs(engine)
+        self.assertTrue(any('逐笔核验上下文缺失' in log for log in logs), logs)
+        self.assertTrue(any('config_version' in log for log in logs), logs)
 
     @staticmethod
     def _logs(engine):

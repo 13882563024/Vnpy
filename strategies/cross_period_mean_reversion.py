@@ -246,14 +246,79 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         # 当前决策时刻：回测/测试下让 exit_layer 内部的时段校验与本次决策对齐
         self._decision_moment: datetime | None = None
 
-    def _owned_algos(self) -> list:
-        """查找本策略已有的真实算法（回测假引擎也可提供 algos）。"""
+    def _engine_algos(self) -> dict | None:
+        """价差算法引擎里的算法表；拿不到（回测替身/未接线）时返回 None。"""
         spread_engine = getattr(self.strategy_engine, "spread_engine", None)
         algo_engine = getattr(spread_engine, "algo_engine", None)
         algos = getattr(algo_engine, "algos", None)
+        if isinstance(algos, dict):
+            return algos
+        algos = getattr(self.strategy_engine, "algos", None)
+        return algos if isinstance(algos, dict) else None
+
+    def _algo_running(self, algoid: str) -> bool:
+        """算法是否还在引擎里跑。
+
+        vn.py 在 ``spread_engine.start_algo()`` 返回之后才把策略登记进
+        ``algo_strategy_map``，算法若在启动过程中就失败（逐笔核验拒发、时段不满足、
+        合约未就绪），策略收不到任何终态回调，``algoids`` / ``jobs`` / ``exit_algoid``
+        会永久残留：这一层从此不再挂止盈，加仓还会每 tick 去撤一个不存在的算法。
+        """
+        algos = self._engine_algos()
         if algos is None:
-            algos = getattr(self.strategy_engine, "algos", {})
+            return True             # 拿不到引擎时不猜，保持原行为
+        algo = algos.get(algoid)
+        if algo is None:
+            return False
+        checker = getattr(algo, "is_active", None)
+        if callable(checker):
+            return bool(checker())
+        return True
+
+    def _owned_algos(self) -> list:
+        """查找本策略已有的真实算法（回测假引擎也可提供 algos）。"""
+        algos = self._engine_algos() or {}
         return [algos[algoid] for algoid in list(self.algoids) if algoid in algos]
+
+    def _forget_algo(self, algoid: str, reason: str) -> None:
+        """把已不在引擎里的算法从策略状态中摘掉；止盈层按退避安排重挂。"""
+        job = self.jobs.pop(algoid, None)
+        self.algoids.discard(algoid)
+        if self.exit_algoid == algoid:
+            self.exit_algoid = ""
+        if job is None:
+            self.write_log(f"算法 {algoid} 已不在引擎里（{reason}），释放挂单占位")
+            return
+        layer = self._find_layer(job.tier_id)
+        if layer is not None:
+            layer.algoid = ""
+        if job.kind != AlgoKind.TAKE_PROFIT:
+            self.write_log(
+                f"算法 {algoid}（{job.reason or job.kind}）已不在引擎里（{reason}），"
+                f"本次动仓按未发出处理"
+            )
+            return
+        if layer is None:
+            self.write_log(
+                f"止盈算法 {algoid} 已不在引擎里（{reason}），但找不到对应层（请人工核对）"
+            )
+            return
+        self._schedule_exit_retry(layer, job, reason)
+
+    def _reclaim_dead_algos(self) -> None:
+        """释放「启动即失败、策略收不到终态回调」的算法占位。
+
+        2026-11-23 夜盘实测：4 张止盈单在逐笔核验阶段被拒发，算法同步终止，
+        策略侧 ``exit_algoid`` 从此再没释放 —— 该层整晚没有止盈单，
+        另一个策略还每 tick 重复撤一个早已不存在的算法（日志刷了 6000 多条）。
+        """
+        algos = self._engine_algos()
+        if algos is None:
+            return
+        dead = [algoid for algoid in list(self.algoids)
+                if algoid and not self._algo_running(algoid)]
+        for algoid in dead:
+            self._forget_algo(algoid, "启动即终止，未收到终态回调")
 
     def _order_by_id(self, orderid: str):
         """查 OMS 里的委托；查不到返回 None（状态不明）。"""
@@ -470,6 +535,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._handle_new_trading_day(moment)
 
         self.session_open = self.sessions.is_open(self._clock(moment))
+        # 先释放「启动即失败」的算法占位，状态机才看得到空闲槽位。
+        self._reclaim_dead_algos()
         self._advance_state(moment)
 
         if not self.session_open:
@@ -1535,9 +1602,15 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         job = self.jobs.get(algoid)
         if job is not None and job.kind == AlgoKind.TAKE_PROFIT:
             job.cancel_for_transition = True
+        if not self._algo_running(algoid):
+            # 引擎里已经没有这个算法（启动即失败/已回收）：直接释放占位。
+            # 否则每 tick 都会重复 stop 一个不存在的算法，日志被刷爆、加仓也被卡住。
+            self._forget_algo(algoid, "撤单时已不在引擎里")
+            return
         self.stop_algo(algoid)
 
     def _cancel_all_algos(self, reason: str) -> None:
+        self._reclaim_dead_algos()
         algoids = self._active_algoids()
         if not algoids:
             return
@@ -1625,6 +1698,8 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         开平仓算法终态回调会调用本方法，自然轮到新的最高层（LIFO），
         所以每层都有自己的止盈，只是不同时刻只挂一张。
         """
+        # 先摘掉「启动即失败、没收到终态回调」的算法，否则下面看不到可用槽位。
+        self._reclaim_dead_algos()
         if self.paused or self._in_advance:
             return
         self._decision_moment = moment      # 供 exit_layer 内部的时段校验对齐
@@ -1818,31 +1893,7 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
             # 主动让出挂单槽位不是止盈失败。若加仓未成或平仓仍有剩余，原层可立即接续。
             if job.cancel_for_transition and getattr(algo, "status", None) == Status.CANCELLED:
                 return
-            layer.retry_count += 1
-            if layer.retry_count >= int(self.exit_retry_limit):
-                layer.state = TierState.PENDING_RETRY
-                cooldown = float(self.exit_retry_cooldown or 0.0)
-                if cooldown > 0:
-                    self._exit_retry_at[layer.tier_id] = time.time() + cooldown
-                    self.write_log(
-                        f"止盈单连续终止 {layer.retry_count} 次，转为低频重试"
-                        f"（{cooldown:g}s 后再试一次）：{layer.describe()}"
-                        f"（请核对柜台与合约状态）"
-                    )
-                else:
-                    self.write_log(
-                        f"止盈单连续终止 {layer.retry_count} 次，停止重挂：{layer.describe()}"
-                        f"（请核对柜台与合约状态）"
-                    )
-            else:
-                # 退避重挂：开盘瞬间昨仓未就绪，毫秒级连发会把重试预算一次烧光
-                # （2026-11-10 09:00 实测：3 次重试只用了 0.85 秒，随后全天熔断）。
-                delay = self._exit_retry_delay(layer.retry_count)
-                self._exit_retry_at[layer.tier_id] = time.time() + delay
-                self.write_log(
-                    f"止盈单未成交（{job.reason}），算法 {job.algoid} 已终止；"
-                    f"{delay:g}s 后重新挂出止盈单：{layer.describe()}"
-                )
+            self._schedule_exit_retry(layer, job, job.reason)
             return
 
         closed = min(volume, layer.volume)
@@ -1850,6 +1901,34 @@ class CrossPeriodMRStrategy(SpreadStrategyTemplate):
         self._exit_retry_at.pop(layer.tier_id, None)
         self.write_log(
             f"止盈成交 第{layer.layer_index}层 价差{price:g} 平{closed:g}手 净利{realized:.0f}元"
+        )
+
+    def _schedule_exit_retry(self, layer: PositionLayer, job: AlgoJob, note: str) -> None:
+        """止盈算法终止后按退避安排重挂：失败一次不放弃该层，也不毫秒级连发烧光预算。"""
+        layer.retry_count += 1
+        if layer.retry_count >= int(self.exit_retry_limit):
+            layer.state = TierState.PENDING_RETRY
+            cooldown = float(self.exit_retry_cooldown or 0.0)
+            if cooldown > 0:
+                self._exit_retry_at[layer.tier_id] = time.time() + cooldown
+                self.write_log(
+                    f"止盈单连续终止 {layer.retry_count} 次，转为低频重试"
+                    f"（{cooldown:g}s 后再试一次）：{layer.describe()}"
+                    f"（{note}；请核对柜台与合约状态）"
+                )
+            else:
+                self.write_log(
+                    f"止盈单连续终止 {layer.retry_count} 次，停止重挂：{layer.describe()}"
+                    f"（{note}；请核对柜台与合约状态）"
+                )
+            return
+        # 退避重挂：开盘瞬间昨仓未就绪，毫秒级连发会把重试预算一次烧光
+        # （2026-11-10 09:00 实测：3 次重试只用了 0.85 秒，随后全天熔断）。
+        delay = self._exit_retry_delay(layer.retry_count)
+        self._exit_retry_at[layer.tier_id] = time.time() + delay
+        self.write_log(
+            f"止盈单未成交（{note}），算法 {job.algoid} 已终止；"
+            f"{delay:g}s 后重新挂出止盈单：{layer.describe()}"
         )
 
     def _on_close_filled(self, algo, job: AlgoJob, volume: float, price: float, filled: bool) -> None:

@@ -98,6 +98,8 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
         self._gate_wait_req = None
         self._gate_wait_at: float = 0.0
         self._gate_wait_logged: bool = False
+        # 「核验上下文缺失」的具体原因 -> 上次打印时间（同一原因 60s 一次，避免刷屏）
+        self._gate_ctx_log_at: dict[str, float] = {}
         self._build_impl()
 
     def pause(self) -> None:
@@ -367,6 +369,14 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
             self._gate_wait_logged = False
             self.write_log(f"逐笔核验排队已取消：{reason}")
 
+    def _log_gate_context_missing(self, reason: str) -> None:
+        """说清楚核验上下文到底缺哪一项；同一原因 60 秒一次，避免排队重试时刷屏。"""
+        now = monotonic()
+        if now - self._gate_ctx_log_at.get(reason, 0.0) < 60:
+            return
+        self._gate_ctx_log_at[reason] = now
+        self.write_log(f"逐笔核验上下文缺失：{reason}")
+
     def _gate_payload(self, req):
         """把当前算法上下文翻译成 (OrderIntent, ScopedLimits)；缺任何一项就拒发。"""
         from trading_core.ctp_facts import account_key, trading_day
@@ -376,25 +386,36 @@ class CrossPeriodAlgo(SpreadAlgoTemplate):
         extra = self.extra
         required = ("near", "far", "near_vt", "far_vt", "exchange", "max_open_lots",
                     "margin_per_lot", "config_version", "trading_sessions")
-        if any(key not in extra for key in required):
+        missing = [key for key in required if key not in extra]
+        if missing:
+            self._log_gate_context_missing(f"算法 extra 缺少 {missing}（策略侧没把核验上下文传下来）")
             return None, None
         engine = self.main_engine
         gateway = engine.get_gateway(self._gate_name) if engine is not None else None
         td = getattr(gateway, "td_api", None) if gateway is not None else None
         if td is None:
+            self._log_gate_context_missing(f"网关 {self._gate_name!r} 没有交易接口（td_api）")
             return None, None
         try:
             account = account_key(td.brokerid, td.userid)
             day = trading_day({}, getattr(td, "cabinet_trading_day", ""))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - 缺任何一项都必须说清楚是哪一项
+            self._log_gate_context_missing(
+                f"账户/交易日取不到（{exc}）；经纪商={getattr(td, 'brokerid', '')!r} "
+                f"投资者={getattr(td, 'userid', '')!r} "
+                f"柜台交易日={getattr(td, 'cabinet_trading_day', '')!r}"
+                f" —— 请重新登录交易接口，确认日志里有「柜台交易日」"
+            )
             return None, None
         purpose = {"open": "open", "take_profit": "take_profit",
                    "close": "risk_exit"}.get(self.purpose)
         if purpose is None:
+            self._log_gate_context_missing(f"未知的算法用途 {self.purpose!r}")
             return None, None
         tier = str(extra.get("tier_id") or self.algoid)
         lots = int(round(float(req.volume)))
         if lots <= 0:
+            self._log_gate_context_missing(f"报单手数无效（volume={req.volume!r}）")
             return None, None
         # 决策号必须"同一笔重试复用、改价改量视为新决策"：否则改价重挂会撞上
         # journal 的 CONFLICT，被永久拒绝。
